@@ -2,7 +2,8 @@
  * Shared types for the Zulip OpenClaw plugin.
  */
 
-import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
+/** OpenClaw config object passed by the host runtime. */
+type OpenClawConfig = any;
 
 export interface ZulipStreamConfig {
   policy?: "allowlist" | "all";

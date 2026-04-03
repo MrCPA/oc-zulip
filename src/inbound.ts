@@ -15,14 +15,15 @@ const HISTORY_LIMIT = 20;
 import {
   dispatchInboundDirectDmWithRuntime,
   resolveInboundDirectDmAccessWithRuntime,
-  createPreCryptoDirectDmAuthorizer,
+  createDirectDmPreCryptoGuardPolicy,
 } from "openclaw/plugin-sdk/channel-inbound";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 import {
   dispatchReplyWithBufferedBlockDispatcher,
   finalizeInboundContext,
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
-import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
+/** PluginRuntime provided by the host via the runtime store. */
+type PluginRuntime = any;
 
 const RECONNECT_DELAY_MS = 5_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
@@ -134,7 +135,7 @@ export async function startZulipEventLoop(
     }
   }
 
-  const authorizeSender = createPreCryptoDirectDmAuthorizer({
+  const authorizeSender = createDirectDmPreCryptoGuardPolicy({
     resolveAccess: async (senderId) => await resolveAccess(senderId, ""),
     issuePairingChallenge: async ({ senderId, reply }) => {
       await pairing.issueChallenge({

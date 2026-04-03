@@ -10,7 +10,9 @@ import {
   createChannelPluginBase,
   buildChannelConfigSchema,
 } from "openclaw/plugin-sdk/core";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
+
+/** OpenClaw config object passed by the host runtime. */
+type OpenClawConfig = any;
 
 import { ZulipClient } from "./client.js";
 import { startZulipEventLoop } from "./inbound.js";
@@ -152,49 +154,51 @@ const ZulipConfigSchema = {
 // ── Plugin ──
 
 export const zulipPlugin = createChatChannelPlugin({
-  base: createChannelPluginBase({
-    id: "zulip",
-    meta: {
+  base: {
+    ...createChannelPluginBase({
       id: "zulip",
-      label: "Zulip",
-      selectionLabel: "Zulip (Bot API)",
-      docsLabel: "zulip",
-      blurb: "Connect OpenClaw to a Zulip server via bot API with DM routing.",
-      order: 95,
-    },
-    capabilities: {
-      chatTypes: ["direct", "channel"],
-      media: false,
-    },
-    reload: { configPrefixes: ["channels.zulip"] },
-    configSchema: buildChannelConfigSchema(ZulipConfigSchema),
-    setup: {
-      resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
-        resolveAccount(cfg, accountId),
-      inspectAccount: (cfg: OpenClawConfig) => inspectAccount(cfg),
-    },
-    config: {
-      listAccountIds: (cfg: OpenClawConfig) =>
-        getZulipSection(cfg)?.botEmail ? [DEFAULT_ACCOUNT_ID] : [],
-      defaultAccountId: () => DEFAULT_ACCOUNT_ID,
-      resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
-        resolveAccount(cfg, accountId),
-      inspectAccount: (cfg: OpenClawConfig) => inspectAccount(cfg),
-      isConfigured: (account: ResolvedZulipAccount) => account.configured,
-      describeAccount: (account: ResolvedZulipAccount) => ({
-        accountId: account.accountId,
-        configured: account.configured,
-        enabled: account.enabled,
-      }),
-    },
-    messaging: {
-      normalizeTarget: (target: string) => target.trim().toLowerCase(),
-      targetResolver: {
-        looksLikeId: (input: string) =>
-          input.trim().includes("@") && input.trim().includes("."),
-        hint: "<email address>",
+      meta: {
+        id: "zulip",
+        label: "Zulip",
+        selectionLabel: "Zulip (Bot API)",
+        docsLabel: "zulip",
+        blurb: "Connect OpenClaw to a Zulip server via bot API with DM routing.",
+        order: 95,
       },
-    },
+      capabilities: {
+        chatTypes: ["direct", "channel"],
+        media: false,
+      },
+      reload: { configPrefixes: ["channels.zulip"] },
+      configSchema: buildChannelConfigSchema(ZulipConfigSchema),
+      setup: {
+        resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
+          resolveAccount(cfg, accountId),
+        inspectAccount: (cfg: OpenClawConfig) => inspectAccount(cfg),
+      },
+      config: {
+        listAccountIds: (cfg: OpenClawConfig) =>
+          getZulipSection(cfg)?.botEmail ? [DEFAULT_ACCOUNT_ID] : [],
+        defaultAccountId: () => DEFAULT_ACCOUNT_ID,
+        resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
+          resolveAccount(cfg, accountId),
+        inspectAccount: (cfg: OpenClawConfig) => inspectAccount(cfg),
+        isConfigured: (account: ResolvedZulipAccount) => account.configured,
+        describeAccount: (account: ResolvedZulipAccount) => ({
+          accountId: account.accountId,
+          configured: account.configured,
+          enabled: account.enabled,
+        }),
+      },
+      messaging: {
+        normalizeTarget: (target: string) => target.trim().toLowerCase(),
+        targetResolver: {
+          looksLikeId: (input: string) =>
+            input.trim().includes("@") && input.trim().includes("."),
+          hint: "<email address>",
+        },
+      },
+    }),
     gateway: {
       startAccount: async (ctx: any) => {
         const account = resolveAccount(ctx.cfg, ctx.account?.accountId);
@@ -252,7 +256,7 @@ export const zulipPlugin = createChatChannelPlugin({
         };
       },
     },
-  }),
+  },
 
   security: {
     dm: {
