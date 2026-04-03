@@ -1,0 +1,6 @@
+node_modules/
+dist/
+dist-working/
+.claude/
+.env
+*.local

@@ -1,0 +1,43 @@
+{
+  "id": "zulip",
+  "kind": "channel",
+  "channels": ["zulip"],
+  "name": "Zulip",
+  "description": "Zulip channel plugin for OpenClaw",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "zulip": {
+        "type": "object",
+        "properties": {
+          "botEmail": { "type": "string" },
+          "botApiKey": { "type": "string" },
+          "site": { "type": "string" },
+          "dm": {
+            "type": "object",
+            "properties": {
+              "policy": { "type": "string", "enum": ["allowlist", "open", "pairing"] },
+              "allowFrom": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          },
+          "streams": {
+            "type": "object",
+            "properties": {
+              "policy": { "type": "string", "enum": ["allowlist", "all"] },
+              "allowed": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "replyPolicy": { "type": "string", "enum": ["dm-allowlist", "mention-only", "open"] }
+            }
+          }
+        },
+        "required": ["botEmail", "botApiKey", "site"]
+      }
+    }
+  }
+}

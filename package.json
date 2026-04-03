@@ -1,0 +1,44 @@
+{
+  "name": "@openclaw/zulip",
+  "version": "0.0.1",
+  "description": "OpenClaw Zulip channel plugin — DM and stream messaging via bot API",
+  "type": "module",
+  "license": "MIT",
+  "author": "OpenClaw Contributors",
+  "keywords": ["openclaw", "zulip", "plugin", "channel", "chatbot"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrCPA/oc-zulip.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist/",
+    "openclaw.plugin.json"
+  ],
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "setupEntry": "./dist/setup-entry.js",
+    "channel": {
+      "id": "zulip",
+      "label": "Zulip",
+      "selectionLabel": "Zulip (Bot API)",
+      "docsLabel": "zulip",
+      "blurb": "Connect OpenClaw to a Zulip server via bot API with DM routing.",
+      "order": 95
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "openclaw": "*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
+}
