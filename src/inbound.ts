@@ -204,6 +204,30 @@ export async function startZulipEventLoop(
       .replace(new RegExp(`@${escapeRegex(account.botEmail)}`, "gi"), "")
       .trim() || rawBody;
 
+    // Handle topic commands (resolve/unresolve)
+    const topicCmd = cleanBody.trim().toLowerCase();
+    if (wasMentioned && (topicCmd === "resolve" || topicCmd === "unresolve")) {
+      try {
+        if (topicCmd === "resolve") {
+          await client.resolveTopic(message.id, topic);
+          ctx.log?.info?.(
+            `[${account.accountId}] resolved topic "${topic}" in ${streamName}`
+          );
+        } else {
+          await client.unresolveTopic(message.id, topic);
+          ctx.log?.info?.(
+            `[${account.accountId}] unresolved topic "${topic}" in ${streamName}`
+          );
+        }
+      } catch (err) {
+        ctx.log?.error?.(
+          `[${account.accountId}] failed to ${topicCmd} topic "${topic}": ${String(err)}`
+        );
+        await client.sendStreamMessage(streamName, topic, `Failed to ${topicCmd} this topic.`);
+      }
+      return;
+    }
+
     const history = await fetchHistory("stream", {
       currentMessageId: message.id,
       stream: streamName,

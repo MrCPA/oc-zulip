@@ -264,6 +264,45 @@ export class ZulipClient {
   }
 
   /**
+   * Update a message (content, topic, or both).
+   * https://zulip.com/api/update-message
+   */
+  async updateMessage(
+    messageId: number,
+    opts: { content?: string; topic?: string; propagateMode?: "change_one" | "change_later" | "change_all" }
+  ): Promise<{ result: string; msg?: string }> {
+    const body: Record<string, any> = {};
+    if (opts.content !== undefined) body.content = opts.content;
+    if (opts.topic !== undefined) body.topic = opts.topic;
+    if (opts.propagateMode) body.propagate_mode = opts.propagateMode;
+    return this.request("PATCH", `/api/v1/messages/${messageId}`, body);
+  }
+
+  /**
+   * Resolve a topic by prepending "✔ " to the topic name.
+   * Requires a message ID from that topic. Uses propagate_mode=change_all
+   * to rename the topic across all messages.
+   */
+  async resolveTopic(messageId: number, currentTopic: string): Promise<void> {
+    if (currentTopic.startsWith("✔ ")) return; // already resolved
+    await this.updateMessage(messageId, {
+      topic: `✔ ${currentTopic}`,
+      propagateMode: "change_all",
+    });
+  }
+
+  /**
+   * Unresolve a topic by removing the "✔ " prefix.
+   */
+  async unresolveTopic(messageId: number, currentTopic: string): Promise<void> {
+    if (!currentTopic.startsWith("✔ ")) return; // not resolved
+    await this.updateMessage(messageId, {
+      topic: currentTopic.slice(2),
+      propagateMode: "change_all",
+    });
+  }
+
+  /**
    * Get the bot's own user profile.
    */
   async getOwnUser(): Promise<{
