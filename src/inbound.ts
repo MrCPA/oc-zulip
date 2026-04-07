@@ -8,7 +8,7 @@
 import { ZulipClient, type ZulipMessage } from "./client.js";
 import { isZulipSenderAllowed } from "./channel.js";
 import type { ZulipGatewayContext } from "./types.js";
-import { stripHtml, escapeRegex, resolveAllowedStreams, isStreamAllowed, sleep } from "./util.js";
+import { stripHtml, escapeRegex, resolveAllowedStreams, hasStreamListening, isStreamAllowed, sleep } from "./util.js";
 
 const HISTORY_LIMIT = 20;
 
@@ -22,8 +22,8 @@ import {
   dispatchReplyWithBufferedBlockDispatcher,
   finalizeInboundContext,
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
-/** PluginRuntime provided by the host via the runtime store. */
-type PluginRuntime = any;
+/** PluginRuntime provided by the host via the runtime store. Typed loosely since shape is defined by the host. */
+type PluginRuntime = Record<string, any>;
 
 const RECONNECT_DELAY_MS = 5_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
@@ -43,11 +43,19 @@ export async function startZulipEventLoop(
     site: account.site,
   });
 
-  const me = await client.getOwnUser();
+  let me: { user_id: number; email: string; full_name: string };
+  try {
+    me = await client.getOwnUser();
+  } catch (err) {
+    throw new Error(
+      `Failed to connect to Zulip at ${account.site} — check site URL, botEmail, and botApiKey. ${String(err)}`
+    );
+  }
   ctx.log?.info(
     `[${account.accountId}] Zulip bot connected as ${me.full_name} (${me.email})`
   );
 
+  const listenToStreams = hasStreamListening(account.streams);
   const streamNames = resolveAllowedStreams(account.streams);
   if (streamNames.length > 0) {
     await subscribeToStreams(client, streamNames, ctx);
@@ -388,7 +396,7 @@ export async function startZulipEventLoop(
   async function eventLoop() {
     while (running) {
       try {
-        const queue = await client.registerQueue(streamNames);
+        const queue = await client.registerQueue(listenToStreams);
         currentQueueId = queue.queue_id;
         let lastEventId = queue.last_event_id;
         reconnectDelay = RECONNECT_DELAY_MS;

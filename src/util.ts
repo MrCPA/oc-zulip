@@ -23,10 +23,17 @@ export function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Resolve which stream names to subscribe to. */
+/** Resolve which stream names to explicitly subscribe to (allowlist only). */
 export function resolveAllowedStreams(streams: ZulipStreamConfig): string[] {
   if (!streams?.allowed?.length) return [];
   return streams.allowed;
+}
+
+/** Whether the config includes any stream listening (allowlist or all). */
+export function hasStreamListening(streams: ZulipStreamConfig): boolean {
+  if (!streams) return false;
+  if (streams.policy === "all") return true;
+  return (streams.allowed?.length ?? 0) > 0;
 }
 
 /** Check if a stream name is in the allowed list. */

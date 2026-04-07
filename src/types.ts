@@ -3,7 +3,8 @@
  */
 
 /** OpenClaw config object passed by the host runtime. */
-type OpenClawConfig = any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type OpenClawConfig = any;
 
 export interface ZulipStreamConfig {
   policy?: "allowlist" | "all";

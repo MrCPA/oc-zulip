@@ -10,12 +10,15 @@
     "type": "git",
     "url": "git+https://github.com/MrCPA/oc-zulip.git"
   },
+  "main": "./dist/index.js",
   "engines": {
     "node": ">=22"
   },
   "files": [
     "dist/",
-    "openclaw.plugin.json"
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
   ],
   "openclaw": {
     "extensions": [
@@ -39,6 +42,7 @@
     "openclaw": "*"
   },
   "devDependencies": {
-    "esbuild": "^0.28.0"
+    "esbuild": "^0.28.0",
+    "typescript": "^5.8.0"
   }
 }

@@ -1,6 +1,6 @@
 # @openclaw/zulip
 
-OpenClaw channel plugin for [Zulip](https://zulip.com). Connects an OpenClaw instance to a Zulip server via the bot API, supporting both direct messages and stream/channel conversations.
+OpenClaw channel plugin for [Zulip](https://zulip.com). Connects an OpenClaw instance to a Zulip server via the bot API, supporting both direct messages and stream/topic conversations.
 
 ## Features
 
@@ -8,21 +8,63 @@ OpenClaw channel plugin for [Zulip](https://zulip.com). Connects an OpenClaw ins
 - **Stream/channel support** with per-stream allowlists and reply policies (mention-only, open, dm-allowlist)
 - **Conversation history** — fetches recent messages so the agent has context
 - **Topic-aware** — each stream topic gets its own isolated session
+- **Topic resolve/unresolve** — `@bot resolve` / `@bot unresolve` to toggle Zulip's topic resolved state
 - **Event queue long-polling** for real-time inbound message handling
 - **Markdown table conversion** via the OpenClaw text pipeline
 - **Exponential backoff** reconnection on connection failures
 
 ## Prerequisites
 
-- An OpenClaw instance
-- A Zulip server (7.0+) with a [bot account](https://zulip.com/help/add-a-bot-or-integration)
-- The bot's email address and API key
+- **OpenClaw** — a running OpenClaw instance
+- **Zulip 7.0+** — uses the `"direct"` message type and `"dm"` narrow operator (introduced in Zulip 7.0)
+- **Node.js 22+** — uses native `fetch` (no HTTP client dependency)
+- **Zulip bot account** — create one via *Organization settings > Bots* ([docs](https://zulip.com/help/add-a-bot-or-integration))
+  - Use a **Generic bot** type
+  - Note the bot's **email address** and **API key**
+
+### Bot permissions in Zulip
+
+The bot account needs:
+
+- Permission to send direct messages (enabled by default for bots)
+- Subscription to any streams you want it to monitor (the plugin will auto-subscribe to streams listed in the `allowed` config when using `allowlist` policy)
+- If using `streams.policy: "all"`, the bot must be manually subscribed to streams in Zulip — the plugin will listen to all streams it's subscribed to
 
 ## Installation
 
 ```bash
 npm install @openclaw/zulip
 ```
+
+## Building from source
+
+```bash
+git clone https://github.com/MrCPA/oc-zulip.git
+cd oc-zulip
+npm install
+npm run build
+```
+
+The build output goes to `dist/`. The plugin is bundled with esbuild — all source is compiled to ESM JS, with `openclaw/*` imports marked as external (resolved at runtime from the host).
+
+To type-check (no emit):
+
+```bash
+npm run typecheck
+```
+
+> **Note:** The typecheck may report errors if the installed `openclaw` SDK version has drifted from the types this plugin was written against. The esbuild bundler ignores types, so the plugin will still build and run correctly.
+
+## Loading the plugin in OpenClaw
+
+Register the plugin in your OpenClaw configuration. The plugin exposes two entry points:
+
+| Entry | Path | Purpose |
+|-------|------|---------|
+| Main | `dist/index.js` | Full plugin — loaded when the channel is enabled |
+| Setup | `dist/setup-entry.js` | Lightweight entry — loaded when the channel is unconfigured |
+
+These are declared in `package.json` under the `openclaw` field and in `openclaw.plugin.json`. OpenClaw discovers and loads them automatically when the package is installed.
 
 ## Configuration
 
@@ -49,43 +91,55 @@ Add the Zulip channel to your OpenClaw config:
 }
 ```
 
+### Required fields
+
+| Field | Description |
+|-------|-------------|
+| `botEmail` | The bot's email address in Zulip |
+| `botApiKey` | The bot's API key (from *Settings > Bots* in Zulip) |
+| `site` | Full URL of the Zulip server (e.g. `https://your-org.zulipchat.com`) |
+
 ### DM policies
 
+Controls who can send direct messages to the bot.
+
 | Policy | Behavior |
 |--------|----------|
-| `allowlist` | Only emails in `allowFrom` can DM the bot (default) |
+| `allowlist` | Only emails in `allowFrom` can DM the bot **(default)** |
 | `open` | Anyone on the Zulip server can DM the bot |
-| `pairing` | Unknown senders receive a pairing challenge |
+| `pairing` | Unknown senders receive a pairing challenge; approved senders are added to the allowlist |
 
-### Stream reply policies
-
-| Policy | Behavior |
-|--------|----------|
-| `mention-only` | Bot replies only when @-mentioned |
-| `dm-allowlist` | Bot replies only to senders in the DM allowlist (default) |
-| `open` | Bot replies to all messages in allowed streams |
+When `policy` is `allowlist` or `pairing`, the `allowFrom` array specifies allowed email addresses. Use `"*"` as a wildcard to allow all senders (equivalent to `open`).
 
 ### Stream access policies
 
+Controls which streams the bot monitors.
+
 | Policy | Behavior |
 |--------|----------|
-| `allowlist` | Only streams listed in `allowed` are monitored (default) |
-| `all` | All streams the bot is subscribed to are monitored |
+| `allowlist` | Only streams listed in `allowed` are monitored **(default)**. The plugin auto-subscribes the bot to these streams on startup. |
+| `all` | All streams the bot is subscribed to are monitored. You must manually subscribe the bot to streams in Zulip. |
 
-## Development
+### Stream reply policies
 
-```bash
-# Install dependencies
-npm install
+Controls when the bot replies to messages in monitored streams.
 
-# Build
-npm run build
+| Policy | Behavior |
+|--------|----------|
+| `dm-allowlist` | Bot replies only to senders in the DM `allowFrom` list **(default)** |
+| `mention-only` | Bot replies only when @-mentioned |
+| `open` | Bot replies to all messages in allowed streams |
 
-# Type check (no emit)
-npm run typecheck
-```
+### Topic commands
 
-### Architecture
+In streams, users can `@mention` the bot with `resolve` or `unresolve` to toggle Zulip's resolved-topic state:
+
+- `@bot resolve` — prepends `✔ ` to the topic name across all messages
+- `@bot unresolve` — removes the `✔ ` prefix
+
+These commands require the bot to have permission to edit topics in the stream.
+
+## Architecture
 
 ```
 src/
@@ -99,13 +153,62 @@ index.ts       — Main plugin entry point
 setup-entry.ts — Lightweight setup entry (loaded when unconfigured)
 ```
 
-The plugin uses Zulip's [event queue API](https://zulip.com/api/real-time-events) for real-time message delivery. Inbound messages are routed through the OpenClaw dispatch pipeline; outbound replies are sent via the [send message API](https://zulip.com/api/send-message).
+### Event flow
+
+1. On startup, the plugin connects to Zulip and verifies credentials via `GET /api/v1/users/me`
+2. If using `allowlist` stream policy, the bot auto-subscribes to the configured streams
+3. An event queue is registered via `POST /api/v1/register` with either:
+   - DM-only narrow (if no stream listening is configured)
+   - All-messages scope (if any stream listening is configured — filtering happens in the handler)
+4. The plugin long-polls `GET /api/v1/events` for new messages
+5. Inbound messages are routed through the OpenClaw dispatch pipeline
+6. Outbound replies are sent via `POST /api/v1/messages`
+
+If the event queue expires (`BAD_EVENT_QUEUE_ID`), the plugin automatically re-registers. On connection errors, it reconnects with exponential backoff (5s → 60s max).
+
+## Troubleshooting
+
+### "Zulip authentication failed (401)"
+
+- Verify `botEmail` and `botApiKey` are correct
+- Regenerate the API key in Zulip (*Settings > Bots > API key*)
+- Make sure the bot account is active (not deactivated)
+
+### "Zulip permission denied (403)"
+
+- The bot may lack permission to send DMs or post to a stream
+- Check the bot's subscription to the target stream
+- Check Zulip's organization-level permissions for bots
+
+### "Invalid Zulip site URL"
+
+- `site` must be a full URL starting with `https://` (e.g. `https://your-org.zulipchat.com`)
+- Do not include a trailing slash or path
+
+### Bot doesn't respond in streams
+
+- Check `streams.policy` — if `allowlist`, ensure the stream is in the `allowed` array
+- Check `streams.replyPolicy`:
+  - `mention-only` requires `@mentioning` the bot
+  - `dm-allowlist` requires the sender to be in `dm.allowFrom`
+- Verify the bot is subscribed to the stream in Zulip
+
+### Bot doesn't respond to DMs
+
+- Check `dm.policy` — if `allowlist`, ensure the sender's email is in `dm.allowFrom`
+- For `pairing` policy, the sender needs to complete the pairing challenge first
+
+### Event queue keeps re-registering
+
+- This is normal if the Zulip server restarts or the connection is interrupted
+- Check network connectivity between OpenClaw and the Zulip server
+- Long-polling timeouts are handled automatically
 
 ## Compatibility
 
 - **Zulip 7.0+** required (uses `"direct"` message type and `"dm"` narrow operator)
-- **Node.js 22+** required
-- Uses native `fetch` (no HTTP client dependency)
+- **Node.js 22+** required (native `fetch`)
+- **OpenClaw** — compatible with current plugin SDK conventions
 
 ## License
 

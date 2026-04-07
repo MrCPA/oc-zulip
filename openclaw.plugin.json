@@ -10,29 +10,46 @@
     "properties": {
       "zulip": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
-          "botEmail": { "type": "string" },
-          "botApiKey": { "type": "string" },
-          "site": { "type": "string" },
+          "botEmail": { "type": "string", "description": "The bot's email address in Zulip" },
+          "botApiKey": { "type": "string", "description": "The bot's API key from Zulip" },
+          "site": { "type": "string", "description": "Full Zulip server URL (e.g. https://your-org.zulipchat.com)" },
           "dm": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
-              "policy": { "type": "string", "enum": ["allowlist", "open", "pairing"] },
+              "policy": {
+                "type": "string",
+                "enum": ["allowlist", "open", "pairing"],
+                "description": "DM access policy (default: allowlist)"
+              },
               "allowFrom": {
                 "type": "array",
-                "items": { "type": "string" }
+                "items": { "type": "string" },
+                "description": "Email addresses allowed to DM the bot (used with allowlist/dm-allowlist policies)"
               }
             }
           },
           "streams": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
-              "policy": { "type": "string", "enum": ["allowlist", "all"] },
+              "policy": {
+                "type": "string",
+                "enum": ["allowlist", "all"],
+                "description": "Stream access policy (default: allowlist)"
+              },
               "allowed": {
                 "type": "array",
-                "items": { "type": "string" }
+                "items": { "type": "string" },
+                "description": "Stream names to monitor (used with allowlist policy)"
               },
-              "replyPolicy": { "type": "string", "enum": ["dm-allowlist", "mention-only", "open"] }
+              "replyPolicy": {
+                "type": "string",
+                "enum": ["dm-allowlist", "mention-only", "open"],
+                "description": "When to reply in streams (default: dm-allowlist)"
+              }
             }
           }
         },

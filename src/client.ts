@@ -62,6 +62,17 @@ export class ZulipClient {
   private baseUrl: string;
 
   constructor(private config: ZulipClientConfig) {
+    if (!config.site || !/^https?:\/\/.+/.test(config.site)) {
+      throw new Error(
+        `Invalid Zulip site URL: "${config.site}". Must be a full URL like https://your-org.zulipchat.com`
+      );
+    }
+    if (!config.botEmail) {
+      throw new Error("Zulip botEmail is required");
+    }
+    if (!config.botApiKey) {
+      throw new Error("Zulip botApiKey is required");
+    }
     // Zulip uses HTTP Basic: base64(email:apiKey)
     const credentials = Buffer.from(
       `${config.botEmail}:${config.botApiKey}`
@@ -109,6 +120,16 @@ export class ZulipClient {
     const resp = await fetch(url, opts);
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
+      if (resp.status === 401) {
+        throw new Error(
+          `Zulip authentication failed (401): check botEmail and botApiKey. ${text}`
+        );
+      }
+      if (resp.status === 403) {
+        throw new Error(
+          `Zulip permission denied (403): the bot may lack required permissions. ${text}`
+        );
+      }
       throw new Error(
         `Zulip API error: ${resp.status} ${resp.statusText} - ${text}`
       );
@@ -118,12 +139,12 @@ export class ZulipClient {
 
   /**
    * Register an event queue for long-polling.
-   * If streamNames are provided, listens to DMs + those streams.
+   * If includeStreams is true, listens to all messages (DMs + streams).
    * Otherwise, DMs only.
    * https://zulip.com/api/register-queue
    */
-  async registerQueue(streamNames?: string[]): Promise<RegisterQueueResponse> {
-    if (streamNames && streamNames.length > 0) {
+  async registerQueue(includeStreams: boolean): Promise<RegisterQueueResponse> {
+    if (includeStreams) {
       // Listen to all messages (DMs + streams) — we filter in the handler
       return this.request<RegisterQueueResponse>("POST", "/api/v1/register", {
         event_types: ["message"],
