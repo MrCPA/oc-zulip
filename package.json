@@ -36,6 +36,7 @@
   },
   "scripts": {
     "build": "node build.mjs",
+    "prepack": "node build.mjs",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {

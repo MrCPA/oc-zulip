@@ -47,6 +47,8 @@ npm run build
 
 The build output goes to `dist/`. The plugin is bundled with esbuild — all source is compiled to ESM JS, with `openclaw/*` imports marked as external (resolved at runtime from the host).
 
+The `prepack` script ensures `dist/` is always built before `npm pack` or `npm publish`, so the published package always contains the compiled plugin code.
+
 To type-check (no emit):
 
 ```bash
