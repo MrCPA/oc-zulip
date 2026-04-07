@@ -10,6 +10,7 @@ import {
   createChannelPluginBase,
   buildChannelConfigSchema,
 } from "openclaw/plugin-sdk/core";
+import { waitUntilAbort } from "openclaw/plugin-sdk/channel-lifecycle";
 
 /** OpenClaw config object passed by the host runtime. */
 type OpenClawConfig = any;
@@ -234,7 +235,7 @@ export const zulipPlugin = createChatChannelPlugin({
           site: account.site,
         });
 
-        const { stop } = await startZulipEventLoop(
+        const lifecycle = await startZulipEventLoop(
           {
             account: { ...account, configured: true },
             cfg: ctx.cfg,
@@ -244,16 +245,21 @@ export const zulipPlugin = createChatChannelPlugin({
           runtime
         );
 
-        activeAccounts.set(account.accountId, { client, stop });
+        activeAccounts.set(account.accountId, { client, stop: lifecycle.stop });
         ctx.log?.info(`[${account.accountId}] Zulip provider started`);
 
-        return {
-          stop: () => {
-            stop();
-            activeAccounts.delete(account.accountId);
-            ctx.log?.info(`[${account.accountId}] Zulip provider stopped`);
-          },
-        };
+        lifecycle.done.catch((err) => {
+          ctx.log?.error?.(
+            `[${account.accountId}] Zulip event loop fatal error: ${String(err)}`
+          );
+        });
+
+        return waitUntilAbort(ctx.abortSignal, async () => {
+          lifecycle.stop();
+          activeAccounts.delete(account.accountId);
+          await lifecycle.done.catch(() => {});
+          ctx.log?.info(`[${account.accountId}] Zulip provider stopped`);
+        });
       },
     },
   },

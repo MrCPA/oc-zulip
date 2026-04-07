@@ -15,8 +15,8 @@ const HISTORY_LIMIT = 20;
 import {
   dispatchInboundDirectDmWithRuntime,
   resolveInboundDirectDmAccessWithRuntime,
-  createDirectDmPreCryptoGuardPolicy,
-} from "openclaw/plugin-sdk/channel-inbound";
+  createPreCryptoDirectDmAuthorizer,
+} from "openclaw/plugin-sdk/direct-dm";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 import {
   dispatchReplyWithBufferedBlockDispatcher,
@@ -35,7 +35,7 @@ const MAX_RECONNECT_DELAY_MS = 60_000;
 export async function startZulipEventLoop(
   ctx: ZulipGatewayContext,
   runtime: PluginRuntime
-): Promise<{ stop: () => void }> {
+): Promise<{ stop: () => void; done: Promise<void> }> {
   const { account, cfg } = ctx;
   const client = new ZulipClient({
     botEmail: account.botEmail,
@@ -143,7 +143,7 @@ export async function startZulipEventLoop(
     }
   }
 
-  const authorizeSender = createDirectDmPreCryptoGuardPolicy({
+  const authorizeSender = createPreCryptoDirectDmAuthorizer({
     resolveAccess: async (senderId) => await resolveAccess(senderId, ""),
     issuePairingChallenge: async ({ senderId, reply }) => {
       await pairing.issueChallenge({
@@ -349,10 +349,10 @@ export async function startZulipEventLoop(
       recipientAddress: `zulip:${account.botEmail}`,
       conversationLabel: message.sender_full_name || senderEmail,
       rawBody,
-      conversationHistory: history || undefined,
       messageId: `zulip-${message.id}`,
       timestamp: message.timestamp * 1_000,
       commandAuthorized: resolvedAccess.commandAuthorized,
+      bodyForAgent: history ? history + rawBody : rawBody,
       deliver: async (payload) => {
         const text = extractText(payload);
         if (!text.trim()) return;
@@ -463,19 +463,15 @@ export async function startZulipEventLoop(
     }
   }
 
-  eventLoop().catch((err) => {
-    ctx.log?.error?.(
-      `[${account.accountId}] Zulip event loop fatal error: ${String(err)}`
-    );
-  });
+  const done = eventLoop();
 
   return {
+    done,
     stop: () => {
       running = false;
       if (currentQueueId) {
         client.deleteQueue(currentQueueId).catch(() => {});
       }
-      ctx.log?.info(`[${account.accountId}] Zulip provider stopped`);
     },
   };
 }
