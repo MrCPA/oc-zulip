@@ -9,11 +9,9 @@ import {
   createChatChannelPlugin,
   createChannelPluginBase,
   buildChannelConfigSchema,
+  type ChannelOutboundAdapter,
+  type OpenClawConfig,
 } from "openclaw/plugin-sdk/core";
-import { waitUntilAbort } from "openclaw/plugin-sdk/channel-lifecycle";
-
-/** OpenClaw config object passed by the host runtime. */
-type OpenClawConfig = any;
 
 import { ZulipClient } from "./client.js";
 import { startZulipEventLoop } from "./inbound.js";
@@ -89,6 +87,35 @@ function inspectAccount(cfg: OpenClawConfig) {
   };
 }
 
+function applySetupInput(
+  cfg: OpenClawConfig,
+  input: {
+    userId?: string;
+    token?: string;
+    url?: string;
+    dmAllowlist?: string[];
+  }
+): OpenClawConfig {
+  const current = getZulipSection(cfg) ?? {};
+  return {
+    ...cfg,
+    channels: {
+      ...(cfg.channels ?? {}),
+      zulip: {
+        ...current,
+        botEmail: input.userId ?? current.botEmail,
+        botApiKey: input.token ?? current.botApiKey,
+        site: input.url ?? current.site,
+        dm: {
+          policy: current.dm?.policy ?? "allowlist",
+          allowFrom: input.dmAllowlist ?? current.dm?.allowFrom ?? [],
+        },
+        streams: current.streams ?? {},
+      },
+    },
+  };
+}
+
 /** Check if a sender email is in the allowlist. */
 export function isZulipSenderAllowed(
   senderEmail: string,
@@ -111,6 +138,52 @@ interface ActiveAccount {
 const activeAccounts = new Map<string, ActiveAccount>();
 
 // ── Config schema ──
+
+const ZULIP_META = {
+  id: "zulip",
+  label: "Zulip",
+  selectionLabel: "Zulip (Bot API)",
+  docsPath: "/docs/plugins/sdk-channel-plugins",
+  docsLabel: "zulip",
+  blurb: "Connect OpenClaw to a Zulip server via bot API with DM routing.",
+  order: 95,
+} as const;
+
+const zulipSetupAdapter = {
+  resolveAccountId: () => DEFAULT_ACCOUNT_ID,
+  validateInput: ({ cfg, input }: { cfg: OpenClawConfig; input: any }) => {
+    const section = getZulipSection(cfg);
+    const botEmail = input.userId ?? section?.botEmail;
+    const botApiKey = input.token ?? section?.botApiKey;
+    const site = input.url ?? section?.site;
+    if (!botEmail || !botApiKey || !site) {
+      return "Zulip setup needs userId (bot email), token (bot API key), and url (site URL).";
+    }
+    return null;
+  },
+  applyAccountConfig: ({ cfg, input }: { cfg: OpenClawConfig; input: any }) =>
+    applySetupInput(cfg, {
+      userId: input.userId,
+      token: input.token,
+      url: input.url,
+      dmAllowlist: input.dmAllowlist,
+    }),
+};
+
+const zulipConfigAdapter = {
+  listAccountIds: (cfg: OpenClawConfig) =>
+    getZulipSection(cfg)?.botEmail ? [DEFAULT_ACCOUNT_ID] : [],
+  defaultAccountId: () => DEFAULT_ACCOUNT_ID,
+  resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
+    resolveAccount(cfg, accountId),
+  inspectAccount: (cfg: OpenClawConfig) => inspectAccount(cfg),
+  isConfigured: (account: ResolvedZulipAccount) => account.configured,
+  describeAccount: (account: ResolvedZulipAccount) => ({
+    accountId: account.accountId,
+    configured: account.configured,
+    enabled: account.enabled,
+  }),
+};
 
 const ZulipConfigSchema = {
   type: "object" as const,
@@ -152,54 +225,84 @@ const ZulipConfigSchema = {
   required: ["botEmail", "botApiKey", "site"] as string[],
 };
 
+const zulipOutboundAdapter: ChannelOutboundAdapter = {
+  deliveryMode: "direct",
+  textChunkLimit: 10_000,
+  sendText: async ({ cfg, to, text, accountId }) => {
+    const aid = accountId ?? DEFAULT_ACCOUNT_ID;
+    const active = activeAccounts.get(aid);
+    if (!active) {
+      throw new Error(`Zulip client not running for account ${aid}`);
+    }
+
+    const finalMessage = (text ?? "").trim();
+    if (!finalMessage) {
+      return { channel: "zulip", messageId: "" };
+    }
+
+    const runtime = getZulipRuntime();
+    const tableMode = runtime.channel.text.resolveMarkdownTableMode({
+      cfg,
+      channel: "zulip",
+      accountId: aid,
+    });
+    const converted = runtime.channel.text.convertMarkdownTables(
+      finalMessage,
+      tableMode
+    );
+
+    const streamMatch = to.match(/^stream:(.+?)::topic:(.+)$/);
+    if (streamMatch) {
+      const [, streamName, topicName] = streamMatch;
+      const result = await active.client.sendStreamMessage(
+        streamName,
+        topicName,
+        converted
+      );
+      return {
+        channel: "zulip",
+        messageId: `zulip-${result.id}`,
+        conversationId: to,
+      };
+    }
+
+    const result = await active.client.sendDirectMessage(to, converted);
+    return {
+      channel: "zulip",
+      messageId: `zulip-${result.id}`,
+      conversationId: to,
+    };
+  },
+};
+
 // ── Plugin ──
 
 export const zulipPlugin = createChatChannelPlugin({
   base: {
     ...createChannelPluginBase({
       id: "zulip",
-      meta: {
-        id: "zulip",
-        label: "Zulip",
-        selectionLabel: "Zulip (Bot API)",
-        docsLabel: "zulip",
-        blurb: "Connect OpenClaw to a Zulip server via bot API with DM routing.",
-        order: 95,
-      },
-      capabilities: {
-        chatTypes: ["direct", "channel"],
-        media: false,
-      },
+      meta: ZULIP_META,
       reload: { configPrefixes: ["channels.zulip"] },
-      configSchema: buildChannelConfigSchema(ZulipConfigSchema),
-      setup: {
-        resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
-          resolveAccount(cfg, accountId),
-        inspectAccount: (cfg: OpenClawConfig) => inspectAccount(cfg),
-      },
-      config: {
-        listAccountIds: (cfg: OpenClawConfig) =>
-          getZulipSection(cfg)?.botEmail ? [DEFAULT_ACCOUNT_ID] : [],
-        defaultAccountId: () => DEFAULT_ACCOUNT_ID,
-        resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
-          resolveAccount(cfg, accountId),
-        inspectAccount: (cfg: OpenClawConfig) => inspectAccount(cfg),
-        isConfigured: (account: ResolvedZulipAccount) => account.configured,
-        describeAccount: (account: ResolvedZulipAccount) => ({
-          accountId: account.accountId,
-          configured: account.configured,
-          enabled: account.enabled,
-        }),
-      },
-      messaging: {
-        normalizeTarget: (target: string) => target.trim().toLowerCase(),
-        targetResolver: {
-          looksLikeId: (input: string) =>
-            input.trim().includes("@") && input.trim().includes("."),
-          hint: "<email address>",
-        },
-      },
+      configSchema: buildChannelConfigSchema(ZulipConfigSchema as any),
+      setup: zulipSetupAdapter,
+      config: zulipConfigAdapter,
     }),
+    id: "zulip",
+    meta: ZULIP_META,
+    setup: zulipSetupAdapter,
+    config: zulipConfigAdapter,
+    capabilities: {
+      chatTypes: ["direct", "channel"],
+      media: false,
+    },
+    messaging: {
+      normalizeTarget: (target: string) => target.trim().toLowerCase(),
+      targetResolver: {
+        looksLikeId: (input: string) =>
+          input.trim().includes("@") && input.trim().includes("."),
+        hint: "<email address>",
+      },
+    },
     gateway: {
       startAccount: async (ctx: any) => {
         const account = resolveAccount(ctx.cfg, ctx.account?.accountId);
@@ -213,11 +316,10 @@ export const zulipPlugin = createChatChannelPlugin({
           site: account.site,
         });
 
-        ctx.log?.info(
+        ctx.log?.info?.(
           `[${account.accountId}] starting Zulip provider (bot: ${account.botEmail})`
         );
 
-        // Stop any existing instance for this account to prevent leaks
         const existing = activeAccounts.get(account.accountId);
         if (existing) {
           ctx.log?.warn?.(
@@ -228,7 +330,6 @@ export const zulipPlugin = createChatChannelPlugin({
         }
 
         const runtime = getZulipRuntime();
-
         const client = new ZulipClient({
           botEmail: account.botEmail,
           botApiKey: account.botApiKey,
@@ -242,11 +343,18 @@ export const zulipPlugin = createChatChannelPlugin({
             log: ctx.log,
             setStatus: ctx.setStatus ?? (() => {}),
           },
-          runtime
+          runtime,
+          client
         );
 
-        activeAccounts.set(account.accountId, { client, stop: lifecycle.stop });
-        ctx.log?.info(`[${account.accountId}] Zulip provider started`);
+        const stop = () => {
+          lifecycle.stop();
+          activeAccounts.delete(account.accountId);
+          ctx.log?.info?.(`[${account.accountId}] Zulip provider stopped`);
+        };
+
+        activeAccounts.set(account.accountId, { client, stop });
+        ctx.log?.info?.(`[${account.accountId}] Zulip provider started`);
 
         lifecycle.done.catch((err) => {
           ctx.log?.error?.(
@@ -254,12 +362,7 @@ export const zulipPlugin = createChatChannelPlugin({
           );
         });
 
-        return waitUntilAbort(ctx.abortSignal, async () => {
-          lifecycle.stop();
-          activeAccounts.delete(account.accountId);
-          await lifecycle.done.catch(() => {});
-          ctx.log?.info(`[${account.accountId}] Zulip provider stopped`);
-        });
+        return { stop };
       },
     },
   },
@@ -280,55 +383,14 @@ export const zulipPlugin = createChatChannelPlugin({
       normalizeAllowEntry: (entry: string) => entry.trim().toLowerCase(),
       notify: async ({ id, message }: { id: string; message: string }) => {
         const active = activeAccounts.get(DEFAULT_ACCOUNT_ID);
-        if (active) await active.client.sendDirectMessage(id, message);
+        if (active) {
+          await active.client.sendDirectMessage(id, message);
+        }
       },
     },
   },
 
   threading: { topLevelReplyToMode: "reply" },
 
-  outbound: {
-    deliveryMode: "direct",
-    textChunkLimit: 10_000,
-    sendText: async ({
-      cfg,
-      to,
-      text,
-      accountId,
-    }: {
-      cfg: OpenClawConfig;
-      to: string;
-      text: string;
-      accountId?: string;
-    }) => {
-      const aid = accountId ?? DEFAULT_ACCOUNT_ID;
-      const active = activeAccounts.get(aid);
-      if (!active)
-        throw new Error(`Zulip client not running for account ${aid}`);
-
-      const finalMessage = (text ?? "").trim();
-      if (!finalMessage) return { channel: "zulip" as const, to, messageId: "" };
-
-      const runtime = getZulipRuntime();
-      const tableMode = runtime.channel.text.resolveMarkdownTableMode({
-        cfg,
-        channel: "zulip",
-        accountId: aid,
-      });
-      const converted = runtime.channel.text.convertMarkdownTables(
-        finalMessage,
-        tableMode
-      );
-
-      const streamMatch = to.match(/^stream:(.+?)::topic:(.+)$/);
-      if (streamMatch) {
-        const [, streamName, topicName] = streamMatch;
-        const result = await active.client.sendStreamMessage(streamName, topicName, converted);
-        return { channel: "zulip" as const, to, messageId: `zulip-${result.id}` };
-      }
-
-      const result = await active.client.sendDirectMessage(to, converted);
-      return { channel: "zulip" as const, to, messageId: `zulip-${result.id}` };
-    },
-  },
+  outbound: zulipOutboundAdapter,
 });

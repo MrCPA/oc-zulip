@@ -8,7 +8,14 @@
 import { ZulipClient, type ZulipMessage } from "./client.js";
 import { isZulipSenderAllowed } from "./channel.js";
 import type { ZulipGatewayContext } from "./types.js";
-import { stripHtml, escapeRegex, resolveAllowedStreams, hasStreamListening, isStreamAllowed, sleep } from "./util.js";
+import {
+  stripHtml,
+  escapeRegex,
+  resolveAllowedStreams,
+  hasStreamListening,
+  isStreamAllowed,
+  sleep,
+} from "./util.js";
 
 const HISTORY_LIMIT = 20;
 
@@ -17,16 +24,29 @@ import {
   resolveInboundDirectDmAccessWithRuntime,
   createPreCryptoDirectDmAuthorizer,
 } from "openclaw/plugin-sdk/direct-dm";
+import type { PluginRuntime } from "openclaw/plugin-sdk/core";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 import {
   dispatchReplyWithBufferedBlockDispatcher,
   finalizeInboundContext,
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
-/** PluginRuntime provided by the host via the runtime store. Typed loosely since shape is defined by the host. */
-type PluginRuntime = Record<string, any>;
 
 const RECONNECT_DELAY_MS = 5_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
+
+function shouldSendImmediateAck(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+  return /(research|investigat|look into|dig into|find out|analy[sz]e|compare|evaluate|explore|figure out)/i.test(
+    normalized
+  );
+}
+
+function immediateAckText(chatType: "dm" | "stream"): string {
+  return chatType === "stream"
+    ? "Starting on that. I'll dig in and report back here."
+    : "Starting on that. I'll dig in and report back.";
+}
 
 /**
  * Start the Zulip event queue listener for a single account.
@@ -34,24 +54,24 @@ const MAX_RECONNECT_DELAY_MS = 60_000;
  */
 export async function startZulipEventLoop(
   ctx: ZulipGatewayContext,
-  runtime: PluginRuntime
+  runtime: PluginRuntime,
+  client = new ZulipClient({
+    botEmail: ctx.account.botEmail,
+    botApiKey: ctx.account.botApiKey,
+    site: ctx.account.site,
+  })
 ): Promise<{ stop: () => void; done: Promise<void> }> {
   const { account, cfg } = ctx;
-  const client = new ZulipClient({
-    botEmail: account.botEmail,
-    botApiKey: account.botApiKey,
-    site: account.site,
-  });
 
   let me: { user_id: number; email: string; full_name: string };
   try {
     me = await client.getOwnUser();
   } catch (err) {
     throw new Error(
-      `Failed to connect to Zulip at ${account.site} — check site URL, botEmail, and botApiKey. ${String(err)}`
+      `Failed to connect to Zulip at ${account.site} - check site URL, botEmail, and botApiKey. ${String(err)}`
     );
   }
-  ctx.log?.info(
+  ctx.log?.info?.(
     `[${account.accountId}] Zulip bot connected as ${me.full_name} (${me.email})`
   );
 
@@ -106,8 +126,9 @@ export async function startZulipEventLoop(
   }
 
   function extractText(payload: unknown): string {
-    if (payload && typeof payload === "object" && "text" in payload)
+    if (payload && typeof payload === "object" && "text" in payload) {
       return String((payload as any).text ?? "");
+    }
     if (typeof payload === "string") return payload;
     return "";
   }
@@ -118,23 +139,39 @@ export async function startZulipEventLoop(
    */
   async function fetchHistory(
     mode: "dm" | "stream",
-    opts: { currentMessageId: number; senderEmail?: string; stream?: string; topic?: string }
+    opts: {
+      currentMessageId: number;
+      senderEmail?: string;
+      stream?: string;
+      topic?: string;
+    }
   ): Promise<string> {
     try {
       const messages =
         mode === "dm"
           ? await client.getDmHistory(opts.senderEmail!, HISTORY_LIMIT)
-          : await client.getStreamTopicHistory(opts.stream!, opts.topic!, HISTORY_LIMIT);
+          : await client.getStreamTopicHistory(
+              opts.stream!,
+              opts.topic!,
+              HISTORY_LIMIT
+            );
 
       const prior = messages.filter((m) => m.id !== opts.currentMessageId);
       if (prior.length === 0) return "";
 
       const lines = prior.map((m) => {
-        const name = m.sender_email === account.botEmail ? `${me.full_name} (bot)` : m.sender_full_name;
-        return `[${name}]: ${m.content}`;
+        const name =
+          m.sender_email === account.botEmail
+            ? `${me.full_name} (bot)`
+            : m.sender_full_name;
+        return `[${name}]: ${stripHtml(m.content)}`;
       });
 
-      return "--- conversation history ---\n" + lines.join("\n") + "\n--- end history ---\n\n";
+      return (
+        "--- conversation history ---\n" +
+        lines.join("\n") +
+        "\n--- end history ---\n\n"
+      );
     } catch (err) {
       ctx.log?.debug?.(
         `[${account.accountId}] failed to fetch conversation history: ${String(err)}`
@@ -198,7 +235,7 @@ export async function startZulipEventLoop(
 
     if (!shouldReplyToStream(replyPolicy, wasMentioned, senderEmail)) {
       ctx.log?.debug?.(
-        `[${account.accountId}] stream message from ${senderEmail} in ${streamName}/${topic} — skipped (policy=${replyPolicy}, mentioned=${wasMentioned})`
+        `[${account.accountId}] stream message from ${senderEmail} in ${streamName}/${topic} skipped (policy=${replyPolicy}, mentioned=${wasMentioned})`
       );
       return;
     }
@@ -207,12 +244,15 @@ export async function startZulipEventLoop(
       `[${account.accountId}] stream message from ${message.sender_full_name} in ${streamName}/${topic}: ${rawBody.slice(0, 60)}...`
     );
 
-    const cleanBody = rawBody
-      .replace(new RegExp(`@\\*\\*${escapeRegex(me.full_name)}\\*\\*`, "gi"), "")
-      .replace(new RegExp(`@${escapeRegex(account.botEmail)}`, "gi"), "")
-      .trim() || rawBody;
+    const cleanBody =
+      rawBody
+        .replace(
+          new RegExp(`@\\*\\*${escapeRegex(me.full_name)}\\*\\*`, "gi"),
+          ""
+        )
+        .replace(new RegExp(`@${escapeRegex(account.botEmail)}`, "gi"), "")
+        .trim() || rawBody;
 
-    // Handle topic commands (resolve/unresolve)
     const topicCmd = cleanBody.trim().toLowerCase();
     if (wasMentioned && (topicCmd === "resolve" || topicCmd === "unresolve")) {
       try {
@@ -231,7 +271,11 @@ export async function startZulipEventLoop(
         ctx.log?.error?.(
           `[${account.accountId}] failed to ${topicCmd} topic "${topic}": ${String(err)}`
         );
-        await client.sendStreamMessage(streamName, topic, `Failed to ${topicCmd} this topic.`);
+        await client.sendStreamMessage(
+          streamName,
+          topic,
+          `Failed to ${topicCmd} this topic.`
+        );
       }
       return;
     }
@@ -241,6 +285,10 @@ export async function startZulipEventLoop(
       stream: streamName,
       topic,
     });
+
+    if (shouldSendImmediateAck(cleanBody)) {
+      await client.sendStreamMessage(streamName, topic, immediateAckText("stream"));
+    }
 
     const streamTarget = `stream:${streamName}::topic:${topic}`;
     const sessionPeer = `zulip:stream:${streamName}:${topic}`;
@@ -336,6 +384,10 @@ export async function startZulipEventLoop(
       currentMessageId: message.id,
       senderEmail,
     });
+
+    if (shouldSendImmediateAck(rawBody)) {
+      await client.sendDirectMessage(senderEmail, immediateAckText("dm"));
+    }
 
     await dispatchInboundDirectDmWithRuntime({
       cfg,
@@ -440,7 +492,7 @@ export async function startZulipEventLoop(
         let lastEventId = queue.last_event_id;
         reconnectDelay = RECONNECT_DELAY_MS;
 
-        ctx.log?.info(
+        ctx.log?.info?.(
           `[${account.accountId}] Zulip event queue registered: ${queue.queue_id}`
         );
 
@@ -522,7 +574,7 @@ async function subscribeToStreams(
     );
     const subscribed = Object.keys(result.subscribed ?? {});
     const already = Object.keys(result.already_subscribed ?? {});
-    ctx.log?.info(
+    ctx.log?.info?.(
       `[${account.accountId}] Zulip streams: subscribed=[${subscribed.join(", ")}] already=[${already.join(", ")}]`
     );
   } catch (err) {
