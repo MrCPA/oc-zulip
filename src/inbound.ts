@@ -373,6 +373,45 @@ export async function startZulipEventLoop(
 
   // ── Message router ──
 
+  const conversationChains = new Map<string, Promise<void>>();
+
+  function getConversationKey(message: ZulipMessage): string {
+    if (message.type === "stream") {
+      const streamName =
+        typeof message.display_recipient === "string"
+          ? message.display_recipient.trim().toLowerCase()
+          : "";
+      const topic = (message.subject || "(no topic)").trim().toLowerCase();
+      return `stream:${streamName}:${topic}`;
+    }
+
+    return `dm:${message.sender_email.trim().toLowerCase()}`;
+  }
+
+  function enqueueMessage(message: ZulipMessage) {
+    const key = getConversationKey(message);
+    const previous = conversationChains.get(key) ?? Promise.resolve();
+
+    const next = previous
+      .catch(() => {})
+      .then(async () => {
+        if (!running) return;
+        await handleMessage(message);
+      })
+      .catch((err) => {
+        ctx.log?.error?.(
+          `[${account.accountId}] error handling Zulip message for ${key}: ${String(err)}`
+        );
+      })
+      .finally(() => {
+        if (conversationChains.get(key) === next) {
+          conversationChains.delete(key);
+        }
+      });
+
+    conversationChains.set(key, next);
+  }
+
   async function handleMessage(message: ZulipMessage) {
     if (message.sender_email === account.botEmail) return;
 
@@ -419,13 +458,7 @@ export async function startZulipEventLoop(
             for (const event of response.events) {
               lastEventId = event.id;
               if (event.type === "message" && event.message) {
-                try {
-                  await handleMessage(event.message);
-                } catch (err) {
-                  ctx.log?.error?.(
-                    `[${account.accountId}] error handling Zulip message: ${String(err)}`
-                  );
-                }
+                enqueueMessage(event.message);
               }
             }
           } catch (err: any) {
