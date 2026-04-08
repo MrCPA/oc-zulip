@@ -25,6 +25,7 @@ export interface ZulipAccountConfig {
 export interface ZulipGatewayContext {
   account: ZulipAccountConfig & { configured: boolean };
   cfg: OpenClawConfig;
+  abortSignal?: AbortSignal;
   log?: {
     info: (msg: string) => void;
     warn?: (msg: string) => void;

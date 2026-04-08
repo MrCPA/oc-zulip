@@ -36,6 +36,8 @@ const RECONNECT_DELAY_MS = 5_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 const DEFAULT_INBOUND_MEDIA_MAX_BYTES = 8 * 1024 * 1024;
 const MAX_INBOUND_ATTACHMENTS = 8;
+const QUEUED_ACK_MIN_INTERVAL_MS = 60_000;
+const MAX_CONVERSATION_CHAIN_MS = 10 * 60_000;
 
 interface DownloadedInboundAttachment {
   url: string;
@@ -190,7 +192,7 @@ async function downloadInboundAttachments(params: {
 function shouldSendImmediateAck(text: string): boolean {
   const normalized = text.trim().toLowerCase();
   if (!normalized) return false;
-  return /(research|investigat|look into|dig into|find out|analy[sz]e|compare|evaluate|explore|figure out)/i.test(
+  return /(^|\b)(research|investigat|look into|dig into|find out|analy[sz]e|compare|evaluate|explore|figure out|begin|start|go ahead|status update|progress update|checkpoint|check in|are you here)(\b|$)/i.test(
     normalized
   );
 }
@@ -235,6 +237,7 @@ export async function startZulipEventLoop(
   }
 
   let running = true;
+  let stopping = false;
   let currentQueueId: string | null = null;
   let reconnectDelay = RECONNECT_DELAY_MS;
 
@@ -617,7 +620,8 @@ export async function startZulipEventLoop(
 
   // ── Message router ──
 
-  const conversationChains = new Map<string, Promise<void>>();
+  const conversationChains = new Map<string, { promise: Promise<void>; startedAt: number }>();
+  const queuedAckTimes = new Map<string, number>();
 
   function getConversationKey(message: ZulipMessage): string {
     if (message.type === "stream") {
@@ -632,9 +636,77 @@ export async function startZulipEventLoop(
     return `dm:${message.sender_email.trim().toLowerCase()}`;
   }
 
+  async function maybeSendQueuedAck(message: ZulipMessage, key: string, ageMs: number) {
+    const lastAckAt = queuedAckTimes.get(key) ?? 0;
+    const now = Date.now();
+    if (now - lastAckAt < QUEUED_ACK_MIN_INTERVAL_MS) return;
+
+    try {
+      if (message.type === "stream") {
+        const streamName =
+          typeof message.display_recipient === "string"
+            ? message.display_recipient
+            : "";
+        const topic = message.subject || "(no topic)";
+        if (!isStreamAllowed(streamName, account.streams)) return;
+
+        const replyPolicy = account.streams.replyPolicy ?? "dm-allowlist";
+        const botMentionPattern = new RegExp(
+          `@\\*\\*${escapeRegex(me.full_name)}\\*\\*|@${escapeRegex(account.botEmail)}`,
+          "i"
+        );
+        const wasMentioned = botMentionPattern.test(message.content);
+        if (!shouldReplyToStream(replyPolicy, wasMentioned, message.sender_email)) {
+          return;
+        }
+
+        await client.sendStreamMessage(
+          streamName,
+          topic,
+          ageMs >= MAX_CONVERSATION_CHAIN_MS
+            ? "The earlier run in this topic looks stuck. I’m restarting the handoff now and will reply here with a fresh update."
+            : "Still working on the earlier request in this topic. I saw your follow-up and I’ll reply here at the next checkpoint."
+        );
+        queuedAckTimes.set(key, now);
+        return;
+      }
+
+      if (message.type === "private" || message.type === "direct") {
+        if (!isZulipSenderAllowed(message.sender_email, account.allowFrom)) return;
+        await client.sendDirectMessage(
+          message.sender_email,
+          ageMs >= MAX_CONVERSATION_CHAIN_MS
+            ? "The earlier run looks stuck. I’m restarting the handoff now and will send a fresh update shortly."
+            : "Still working on that. I saw your follow-up and I’ll send the next checkpoint shortly."
+        );
+        queuedAckTimes.set(key, now);
+      }
+    } catch (err) {
+      ctx.log?.warn?.(
+        `[${account.accountId}] failed sending queued Zulip ack for ${key}: ${String(err)}`
+      );
+    }
+  }
+
   function enqueueMessage(message: ZulipMessage) {
     const key = getConversationKey(message);
-    const previous = conversationChains.get(key) ?? Promise.resolve();
+    const now = Date.now();
+    const existing = conversationChains.get(key);
+    let previous = Promise.resolve();
+
+    if (existing) {
+      const ageMs = now - existing.startedAt;
+      if (ageMs >= MAX_CONVERSATION_CHAIN_MS) {
+        ctx.log?.warn?.(
+          `[${account.accountId}] clearing stale Zulip conversation chain for ${key} after ${ageMs}ms`
+        );
+        void maybeSendQueuedAck(message, key, ageMs);
+        conversationChains.delete(key);
+      } else {
+        void maybeSendQueuedAck(message, key, ageMs);
+        previous = existing.promise;
+      }
+    }
 
     const next = previous
       .catch(() => {})
@@ -648,12 +720,13 @@ export async function startZulipEventLoop(
         );
       })
       .finally(() => {
-        if (conversationChains.get(key) === next) {
+        const current = conversationChains.get(key);
+        if (current?.promise === next) {
           conversationChains.delete(key);
         }
       });
 
-    conversationChains.set(key, next);
+    conversationChains.set(key, { promise: next, startedAt: now });
   }
 
   async function handleMessage(message: ZulipMessage) {
@@ -721,7 +794,7 @@ export async function startZulipEventLoop(
             ctx.log?.error?.(
               `[${account.accountId}] Zulip poll error: ${String(err)}`
             );
-            await sleep(2_000);
+            await sleep(2_000, ctx.abortSignal);
           }
         }
 
@@ -734,10 +807,12 @@ export async function startZulipEventLoop(
         ctx.log?.error?.(
           `[${account.accountId}] Zulip queue registration failed: ${String(err)}, retrying in ${reconnectDelay}ms`
         );
-        await sleep(reconnectDelay);
+        await sleep(reconnectDelay, ctx.abortSignal);
         reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY_MS);
       }
     }
+
+    ctx.log?.info?.(`[${account.accountId}] Zulip event loop exited`);
   }
 
   const done = eventLoop();
@@ -745,9 +820,13 @@ export async function startZulipEventLoop(
   return {
     done,
     stop: () => {
+      if (stopping) return;
+      stopping = true;
       running = false;
-      if (currentQueueId) {
-        client.deleteQueue(currentQueueId).catch(() => {});
+      const queueId = currentQueueId;
+      currentQueueId = null;
+      if (queueId) {
+        client.deleteQueue(queueId).catch(() => {});
       }
     },
   };

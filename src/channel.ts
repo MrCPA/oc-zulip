@@ -12,6 +12,8 @@ import {
   type ChannelOutboundAdapter,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/core";
+import { resolveChannelMediaMaxBytes } from "openclaw/plugin-sdk/media-runtime";
+import { loadOutboundMediaFromUrl } from "openclaw/plugin-sdk/outbound-media";
 
 import { ZulipClient } from "./client.js";
 import { startZulipEventLoop } from "./inbound.js";
@@ -227,6 +229,61 @@ const ZulipConfigSchema = {
   required: ["botEmail", "botApiKey", "site"] as string[],
 };
 
+function convertOutboundText(
+  cfg: OpenClawConfig,
+  aid: string,
+  text: string
+): string {
+  const finalMessage = text.trim();
+  if (!finalMessage) return "";
+
+  const runtime = getZulipRuntime();
+  const tableMode = runtime.channel.text.resolveMarkdownTableMode({
+    cfg,
+    channel: "zulip",
+    accountId: aid,
+  });
+  return runtime.channel.text.convertMarkdownTables(finalMessage, tableMode);
+}
+
+function buildZulipOutboundResult(
+  to: string,
+  result: { id: number }
+): { channel: string; messageId: string; conversationId: string } {
+  return {
+    channel: "zulip",
+    messageId: `zulip-${result.id}`,
+    conversationId: to,
+  };
+}
+
+async function sendResolvedZulipMessage(params: {
+  active: ActiveAccount;
+  to: string;
+  content: string;
+}): Promise<{ channel: string; messageId: string; conversationId: string }> {
+  const streamMatch = params.to.match(/^stream:(.+?)::topic:(.+)$/);
+  if (streamMatch) {
+    const [, streamName, topicName] = streamMatch;
+    const result = await params.active.client.sendStreamMessage(
+      streamName,
+      topicName,
+      params.content
+    );
+    return buildZulipOutboundResult(params.to, result);
+  }
+
+  const result = await params.active.client.sendDirectMessage(
+    params.to,
+    params.content
+  );
+  return buildZulipOutboundResult(params.to, result);
+}
+
+function escapeZulipLinkLabel(value: string): string {
+  return value.replace(/([\\\[\]\(\)])/g, "\\$1");
+}
+
 const zulipOutboundAdapter: ChannelOutboundAdapter = {
   deliveryMode: "direct",
   textChunkLimit: 10_000,
@@ -237,43 +294,67 @@ const zulipOutboundAdapter: ChannelOutboundAdapter = {
       throw new Error(`Zulip client not running for account ${aid}`);
     }
 
-    const finalMessage = (text ?? "").trim();
-    if (!finalMessage) {
+    const converted = convertOutboundText(cfg, aid, text ?? "");
+    if (!converted) {
       return { channel: "zulip", messageId: "" };
     }
 
-    const runtime = getZulipRuntime();
-    const tableMode = runtime.channel.text.resolveMarkdownTableMode({
-      cfg,
-      channel: "zulip",
-      accountId: aid,
+    return sendResolvedZulipMessage({
+      active,
+      to,
+      content: converted,
     });
-    const converted = runtime.channel.text.convertMarkdownTables(
-      finalMessage,
-      tableMode
-    );
-
-    const streamMatch = to.match(/^stream:(.+?)::topic:(.+)$/);
-    if (streamMatch) {
-      const [, streamName, topicName] = streamMatch;
-      const result = await active.client.sendStreamMessage(
-        streamName,
-        topicName,
-        converted
-      );
-      return {
-        channel: "zulip",
-        messageId: `zulip-${result.id}`,
-        conversationId: to,
-      };
+  },
+  sendMedia: async ({
+    cfg,
+    to,
+    text,
+    mediaUrl,
+    mediaAccess,
+    mediaLocalRoots,
+    mediaReadFile,
+    accountId,
+  }) => {
+    const aid = accountId ?? DEFAULT_ACCOUNT_ID;
+    const active = activeAccounts.get(aid);
+    if (!active) {
+      throw new Error(`Zulip client not running for account ${aid}`);
+    }
+    if (!mediaUrl) {
+      throw new Error("Zulip mediaUrl is required");
     }
 
-    const result = await active.client.sendDirectMessage(to, converted);
-    return {
-      channel: "zulip",
-      messageId: `zulip-${result.id}`,
-      conversationId: to,
-    };
+    const maxBytes =
+      resolveChannelMediaMaxBytes({
+        cfg,
+        resolveChannelLimitMb: ({ cfg: channelCfg }) =>
+          ((channelCfg.channels as Record<string, any>)?.zulip)?.mediaMaxMb,
+        accountId: aid,
+      }) ??
+      20 * 1024 * 1024;
+
+    const media = await loadOutboundMediaFromUrl(mediaUrl, {
+      maxBytes,
+      mediaAccess,
+      mediaLocalRoots,
+      mediaReadFile,
+    });
+    const fileName = media.fileName?.trim() || "attachment";
+    const upload = await active.client.uploadFile({
+      buffer: media.buffer,
+      fileName,
+      contentType: media.contentType,
+    });
+
+    const caption = convertOutboundText(cfg, aid, text ?? "");
+    const linkLine = `[${escapeZulipLinkLabel(fileName)}](${upload.fileUrl})`;
+    const content = caption ? `${caption}\n\n${linkLine}` : linkLine;
+
+    return sendResolvedZulipMessage({
+      active,
+      to,
+      content,
+    });
   },
 };
 
@@ -295,7 +376,7 @@ export const zulipPlugin = createChatChannelPlugin({
     config: zulipConfigAdapter,
     capabilities: {
       chatTypes: ["direct", "channel"],
-      media: false,
+      media: true,
     },
     messaging: {
       normalizeTarget: (target: string) => target.trim().toLowerCase(),
@@ -342,6 +423,7 @@ export const zulipPlugin = createChatChannelPlugin({
           {
             account: { ...account, configured: true },
             cfg: ctx.cfg,
+            abortSignal: ctx.abortSignal,
             log: ctx.log,
             setStatus: ctx.setStatus ?? (() => {}),
           },
@@ -349,7 +431,10 @@ export const zulipPlugin = createChatChannelPlugin({
           client
         );
 
+        let stopped = false;
         const stop = () => {
+          if (stopped) return;
+          stopped = true;
           lifecycle.stop();
           activeAccounts.delete(account.accountId);
           ctx.log?.info?.(`[${account.accountId}] Zulip provider stopped`);
@@ -358,13 +443,20 @@ export const zulipPlugin = createChatChannelPlugin({
         activeAccounts.set(account.accountId, { client, stop });
         ctx.log?.info?.(`[${account.accountId}] Zulip provider started`);
 
-        lifecycle.done.catch((err) => {
+        const onAbort = () => stop();
+        ctx.abortSignal?.addEventListener?.("abort", onAbort, { once: true });
+
+        try {
+          await lifecycle.done;
+        } catch (err) {
           ctx.log?.error?.(
             `[${account.accountId}] Zulip event loop fatal error: ${String(err)}`
           );
-        });
-
-        return { stop };
+          throw err;
+        } finally {
+          ctx.abortSignal?.removeEventListener?.("abort", onAbort);
+          stop();
+        }
       },
     },
   },

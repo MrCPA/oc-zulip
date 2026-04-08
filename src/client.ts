@@ -57,6 +57,14 @@ export interface DownloadedZulipFile {
   fileName?: string;
 }
 
+export interface UploadedZulipFile {
+  uri?: string;
+  url?: string;
+  result: string;
+  msg?: string;
+  fileUrl: string;
+}
+
 export interface GetMessagesResponse {
   result: string;
   msg?: string;
@@ -148,6 +156,53 @@ export class ZulipClient {
       );
     }
     return resp.json() as Promise<T>;
+  }
+
+  async uploadFile(params: {
+    buffer: Buffer;
+    fileName: string;
+    contentType?: string;
+  }): Promise<UploadedZulipFile> {
+    const url = this.resolveUrl("/api/v1/user_uploads");
+    const form = new FormData();
+    form.set(
+      "file",
+      new Blob([params.buffer], {
+        type: params.contentType || "application/octet-stream",
+      }),
+      params.fileName
+    );
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: this.authHeader,
+      },
+      body: form,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(
+        `Zulip upload failed: ${resp.status} ${resp.statusText} - ${text}`
+      );
+    }
+
+    const result = (await resp.json()) as {
+      uri?: string;
+      url?: string;
+      result: string;
+      msg?: string;
+    };
+    const fileRef = result.url ?? result.uri;
+    if (!fileRef) {
+      throw new Error("Zulip upload succeeded but no file URL was returned");
+    }
+
+    return {
+      ...result,
+      fileUrl: this.resolveUrl(fileRef),
+    };
   }
 
   /**
