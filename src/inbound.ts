@@ -24,6 +24,7 @@ import {
   resolveInboundDirectDmAccessWithRuntime,
   createPreCryptoDirectDmAuthorizer,
 } from "openclaw/plugin-sdk/direct-dm";
+import { resolveChannelMediaMaxBytes, saveMediaBuffer } from "openclaw/plugin-sdk/media-runtime";
 import type { PluginRuntime } from "openclaw/plugin-sdk/core";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 import {
@@ -33,6 +34,158 @@ import {
 
 const RECONNECT_DELAY_MS = 5_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
+const DEFAULT_INBOUND_MEDIA_MAX_BYTES = 8 * 1024 * 1024;
+const MAX_INBOUND_ATTACHMENTS = 8;
+
+interface DownloadedInboundAttachment {
+  url: string;
+  path: string;
+  contentType?: string;
+  name?: string;
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) =>
+      String.fromCodePoint(parseInt(code, 16))
+    );
+}
+
+function stripInlineHtml(value: string): string {
+  return decodeHtmlEntities(value.replace(/<[^>]+>/g, " "))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isSameOriginZulipUpload(url: string, site: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const base = new URL(site);
+    return parsed.origin === base.origin && parsed.pathname.startsWith("/user_uploads/");
+  } catch {
+    return false;
+  }
+}
+
+function extractInboundAttachmentCandidates(
+  html: string,
+  site: string
+): Array<{ url: string; name?: string }> {
+  const matches: Array<{ url: string; name?: string }> = [];
+  const seen = new Set<string>();
+
+  const push = (rawUrl: string | undefined, rawName?: string) => {
+    if (!rawUrl) return;
+    let resolved: string;
+    try {
+      resolved = new URL(rawUrl, site).toString();
+    } catch {
+      return;
+    }
+    if (!isSameOriginZulipUpload(resolved, site) || seen.has(resolved)) return;
+    seen.add(resolved);
+    matches.push({
+      url: resolved,
+      name: rawName?.trim() ? stripInlineHtml(rawName) : undefined,
+    });
+  };
+
+  const anchorRegex = /<a\b[^>]*\bhref=(['"])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi;
+  for (const match of html.matchAll(anchorRegex)) {
+    push(match[2], match[3]);
+    if (matches.length >= MAX_INBOUND_ATTACHMENTS) return matches;
+  }
+
+  const mediaRegex = /<(?:img|source|video|audio)\b[^>]*\bsrc=(['"])(.*?)\1[^>]*>/gi;
+  for (const match of html.matchAll(mediaRegex)) {
+    push(match[2]);
+    if (matches.length >= MAX_INBOUND_ATTACHMENTS) return matches;
+  }
+
+  return matches;
+}
+
+function resolveInboundMediaMaxBytes(cfg: Record<string, any>, accountId: string): number {
+  return (
+    resolveChannelMediaMaxBytes({
+      cfg,
+      accountId,
+      resolveChannelLimitMb: ({ cfg }) => {
+        const limit = (cfg.channels as Record<string, any> | undefined)?.zulip?.mediaMaxMb;
+        return typeof limit === "number" && Number.isFinite(limit) && limit > 0
+          ? limit
+          : undefined;
+      },
+    }) ?? DEFAULT_INBOUND_MEDIA_MAX_BYTES
+  );
+}
+
+function buildAttachmentNote(attachments: DownloadedInboundAttachment[]): string {
+  if (attachments.length === 0) return "";
+  const labels = attachments
+    .map((attachment) => attachment.name?.trim())
+    .filter((value): value is string => Boolean(value));
+  if (labels.length === 0) {
+    return attachments.length === 1 ? "[Attachment received]" : `[${attachments.length} attachments received]`;
+  }
+  const preview = labels.slice(0, 4).join(", ");
+  const suffix = labels.length > 4 ? `, +${labels.length - 4} more` : "";
+  return `[Attachments: ${preview}${suffix}]`;
+}
+
+async function downloadInboundAttachments(params: {
+  html: string;
+  client: ZulipClient;
+  ctx: ZulipGatewayContext;
+}): Promise<DownloadedInboundAttachment[]> {
+  const { html, client, ctx } = params;
+  const candidates = extractInboundAttachmentCandidates(html, ctx.account.site);
+  if (candidates.length === 0) return [];
+
+  const maxBytes = resolveInboundMediaMaxBytes(
+    ctx.cfg as Record<string, any>,
+    ctx.account.accountId
+  );
+  const attachments: DownloadedInboundAttachment[] = [];
+
+  for (const candidate of candidates) {
+    try {
+      const downloaded = await client.downloadFile(candidate.url, { maxBytes });
+      const saved = await saveMediaBuffer(
+        downloaded.buffer,
+        downloaded.contentType,
+        "inbound",
+        maxBytes,
+        candidate.name ?? downloaded.fileName
+      );
+      attachments.push({
+        url: downloaded.url,
+        path: saved.path,
+        contentType: saved.contentType,
+        name: candidate.name ?? downloaded.fileName,
+      });
+    } catch (err) {
+      ctx.log?.warn?.(
+        `[${ctx.account.accountId}] failed to download Zulip attachment ${candidate.url}: ${String(err)}`
+      );
+    }
+  }
+
+  if (attachments.length > 0) {
+    ctx.log?.info?.(
+      `[${ctx.account.accountId}] downloaded ${attachments.length} Zulip attachment(s)`
+    );
+  }
+
+  return attachments;
+}
 
 function shouldSendImmediateAck(text: string): boolean {
   const normalized = text.trim().toLowerCase();
@@ -224,7 +377,13 @@ export async function startZulipEventLoop(
     }
 
     const rawBody = stripHtml(message.content);
-    if (!rawBody.trim()) return;
+    const attachments = await downloadInboundAttachments({
+      html: message.content,
+      client,
+      ctx,
+    });
+    const attachmentNote = buildAttachmentNote(attachments);
+    if (!rawBody.trim() && attachments.length === 0) return;
 
     const replyPolicy = account.streams.replyPolicy ?? "dm-allowlist";
     const botMentionPattern = new RegExp(
@@ -252,6 +411,7 @@ export async function startZulipEventLoop(
         )
         .replace(new RegExp(`@${escapeRegex(account.botEmail)}`, "gi"), "")
         .trim() || rawBody;
+    const effectiveBody = cleanBody || rawBody || attachmentNote;
 
     const topicCmd = cleanBody.trim().toLowerCase();
     if (wasMentioned && (topicCmd === "resolve" || topicCmd === "unresolve")) {
@@ -285,6 +445,12 @@ export async function startZulipEventLoop(
       stream: streamName,
       topic,
     });
+    const bodyForAgent = [
+      history + effectiveBody,
+      attachmentNote && attachmentNote !== effectiveBody ? attachmentNote : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
 
     if (shouldSendImmediateAck(cleanBody)) {
       await client.sendStreamMessage(streamName, topic, immediateAckText("stream"));
@@ -295,10 +461,10 @@ export async function startZulipEventLoop(
 
     await dispatchReplyWithBufferedBlockDispatcher({
       ctx: finalizeInboundContext({
-        Body: cleanBody,
-        BodyForAgent: history + cleanBody,
-        RawBody: cleanBody,
-        CommandBody: cleanBody,
+        Body: effectiveBody,
+        BodyForAgent: bodyForAgent,
+        RawBody: rawBody || attachmentNote,
+        CommandBody: effectiveBody,
         From: `zulip:${senderEmail}`,
         To: streamTarget,
         SessionKey: `zulip:${account.accountId}:${sessionPeer}`,
@@ -319,6 +485,9 @@ export async function startZulipEventLoop(
         OriginatingTo: streamTarget,
         Provider: "zulip",
         Surface: "zulip",
+        MediaPaths: attachments.map((attachment) => attachment.path),
+        MediaUrls: attachments.map((attachment) => attachment.url),
+        MediaTypes: attachments.map((attachment) => attachment.contentType),
       }),
       cfg,
       dispatcherOptions: {
@@ -357,6 +526,12 @@ export async function startZulipEventLoop(
   async function handleDirectMessage(message: ZulipMessage) {
     const senderEmail = message.sender_email;
     const rawBody = stripHtml(message.content);
+    const attachments = await downloadInboundAttachments({
+      html: message.content,
+      client,
+      ctx,
+    });
+    const attachmentNote = buildAttachmentNote(attachments);
 
     const authResult = await authorizeSender({
       senderId: senderEmail,
@@ -380,10 +555,21 @@ export async function startZulipEventLoop(
       return;
     }
 
+    if (!rawBody.trim() && attachments.length === 0) {
+      return;
+    }
+
     const history = await fetchHistory("dm", {
       currentMessageId: message.id,
       senderEmail,
     });
+    const effectiveBody = rawBody || attachmentNote;
+    const bodyForAgent = [
+      history + effectiveBody,
+      attachmentNote && attachmentNote !== effectiveBody ? attachmentNote : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
 
     if (shouldSendImmediateAck(rawBody)) {
       await client.sendDirectMessage(senderEmail, immediateAckText("dm"));
@@ -400,11 +586,12 @@ export async function startZulipEventLoop(
       senderAddress: `zulip:${senderEmail}`,
       recipientAddress: `zulip:${account.botEmail}`,
       conversationLabel: message.sender_full_name || senderEmail,
-      rawBody,
+      rawBody: effectiveBody,
       messageId: `zulip-${message.id}`,
       timestamp: message.timestamp * 1_000,
       commandAuthorized: resolvedAccess.commandAuthorized,
-      bodyForAgent: history ? history + rawBody : rawBody,
+      commandBody: effectiveBody,
+      bodyForAgent,
       deliver: async (payload) => {
         const text = extractText(payload);
         if (!text.trim()) return;
@@ -419,6 +606,11 @@ export async function startZulipEventLoop(
         ctx.log?.error?.(
           `[${account.accountId}] Zulip ${info.kind} reply failed: ${String(err)}`
         );
+      },
+      extraContext: {
+        MediaPaths: attachments.map((attachment) => attachment.path),
+        MediaUrls: attachments.map((attachment) => attachment.url),
+        MediaTypes: attachments.map((attachment) => attachment.contentType),
       },
     });
   }

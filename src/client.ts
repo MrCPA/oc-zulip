@@ -5,6 +5,8 @@
  * Docs: https://zulip.com/api/
  */
 
+import { fetchRemoteMedia } from "openclaw/plugin-sdk/media-runtime";
+
 export interface ZulipClientConfig {
   botEmail: string;
   botApiKey: string;
@@ -48,6 +50,13 @@ export interface SendMessageResponse {
   msg?: string;
 }
 
+export interface DownloadedZulipFile {
+  url: string;
+  buffer: Buffer;
+  contentType?: string;
+  fileName?: string;
+}
+
 export interface GetMessagesResponse {
   result: string;
   msg?: string;
@@ -81,12 +90,16 @@ export class ZulipClient {
     this.baseUrl = config.site.replace(/\/+$/, "");
   }
 
+  private resolveUrl(pathOrUrl: string): string {
+    return new URL(pathOrUrl, `${this.baseUrl}/`).toString();
+  }
+
   private async request<T>(
     method: string,
     path: string,
     body?: Record<string, any>
   ): Promise<T> {
-    let url = `${this.baseUrl}${path}`;
+    let url = this.resolveUrl(path);
     const headers: Record<string, string> = {
       Authorization: this.authHeader,
     };
@@ -193,6 +206,33 @@ export class ZulipClient {
     await this.request("DELETE", "/api/v1/events", {
       queue_id: queueId,
     }).catch(() => {});
+  }
+
+  /**
+   * Download a Zulip-served file using the bot's auth.
+   */
+  async downloadFile(
+    pathOrUrl: string,
+    opts: { maxBytes?: number } = {}
+  ): Promise<DownloadedZulipFile> {
+    const url = this.resolveUrl(pathOrUrl);
+    const downloaded = await fetchRemoteMedia({
+      url,
+      maxBytes: opts.maxBytes,
+      requestInit: {
+        method: "GET",
+        headers: {
+          Authorization: this.authHeader,
+        },
+      },
+      filePathHint: new URL(url).pathname,
+    });
+    return {
+      url,
+      buffer: downloaded.buffer,
+      contentType: downloaded.contentType,
+      fileName: downloaded.fileName,
+    };
   }
 
   /**

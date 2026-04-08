@@ -24,6 +24,7 @@ export interface ZulipChannelConfig {
   botEmail?: string;
   botApiKey?: string;
   site?: string;
+  mediaMaxMb?: number;
   dm?: {
     policy?: string;
     allowFrom?: string[];
@@ -191,6 +192,7 @@ const ZulipConfigSchema = {
     botEmail: { type: "string" as const },
     botApiKey: { type: "string" as const },
     site: { type: "string" as const },
+    mediaMaxMb: { type: "number" as const },
     dm: {
       type: "object" as const,
       properties: {
