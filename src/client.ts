@@ -165,9 +165,10 @@ export class ZulipClient {
   }): Promise<UploadedZulipFile> {
     const url = this.resolveUrl("/api/v1/user_uploads");
     const form = new FormData();
+    const body = new Uint8Array(params.buffer);
     form.set(
       "file",
-      new Blob([params.buffer], {
+      new Blob([body], {
         type: params.contentType || "application/octet-stream",
       }),
       params.fileName
@@ -353,13 +354,15 @@ export class ZulipClient {
   async getStreamTopicHistory(
     stream: string,
     topic: string,
-    numBefore = 20
+    numBefore = 20,
+    anchor?: string | number
   ): Promise<ZulipMessage[]> {
     const resp = await this.getMessages({
       narrow: [
         { operator: "channel", operand: stream },
         { operator: "topic", operand: topic },
       ],
+      anchor,
       numBefore,
     });
     return resp.messages;
@@ -370,10 +373,12 @@ export class ZulipClient {
    */
   async getDmHistory(
     userEmail: string,
-    numBefore = 20
+    numBefore = 20,
+    anchor?: string | number
   ): Promise<ZulipMessage[]> {
     const resp = await this.getMessages({
       narrow: [{ operator: "dm", operand: userEmail }],
+      anchor,
       numBefore,
     });
     return resp.messages;

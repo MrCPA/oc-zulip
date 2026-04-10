@@ -36,6 +36,9 @@ const RECONNECT_DELAY_MS = 5_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 const DEFAULT_INBOUND_MEDIA_MAX_BYTES = 8 * 1024 * 1024;
 const MAX_INBOUND_ATTACHMENTS = 8;
+const HISTORY_ATTACHMENT_LOOKBACK = 12;
+const MAX_HISTORY_ATTACHMENT_CANDIDATES = 24;
+const MAX_RECOVERED_ATTACHMENTS = 1;
 const QUEUED_ACK_MIN_INTERVAL_MS = 60_000;
 const MAX_CONVERSATION_CHAIN_MS = 10 * 60_000;
 
@@ -44,6 +47,24 @@ interface DownloadedInboundAttachment {
   path: string;
   contentType?: string;
   name?: string;
+  origin: "current-message" | "conversation-history";
+  sourceMessageId?: number;
+  sourceSenderEmail?: string;
+}
+
+interface InboundAttachmentCandidate {
+  url: string;
+  name?: string;
+  isImage: boolean;
+  sourceMessageId?: number;
+  sourceSenderEmail?: string;
+  origin: "current-message" | "conversation-history";
+}
+
+interface AttachmentReferenceIntent {
+  shouldRecover: boolean;
+  preferImage: boolean;
+  preferFile: boolean;
 }
 
 function decodeHtmlEntities(value: string): string {
@@ -76,11 +97,54 @@ function isSameOriginZulipUpload(url: string, site: string): boolean {
   }
 }
 
+function getAttachmentExtension(value: string | undefined): string {
+  if (!value) return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  try {
+    const pathname = trimmed.includes("://") ? new URL(trimmed).pathname : trimmed;
+    const base = pathname.split("/").pop() ?? "";
+    const match = base.match(/\.([a-z0-9]+)$/i);
+    return match?.[1]?.toLowerCase() ?? "";
+  } catch {
+    const match = trimmed.match(/\.([a-z0-9]+)$/i);
+    return match?.[1]?.toLowerCase() ?? "";
+  }
+}
+
+function isLikelyImageAttachment(url: string, name?: string): boolean {
+  const extension = getAttachmentExtension(name) || getAttachmentExtension(url);
+  return ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif", "avif"].includes(
+    extension
+  );
+}
+
+function analyzeAttachmentReferenceIntent(text: string): AttachmentReferenceIntent {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) {
+    return { shouldRecover: false, preferImage: false, preferFile: false };
+  }
+
+  const imageWords = /\b(image|photo|picture|screenshot|thumbnail|graphic|diagram|chart|scan|snapshot)\b/i;
+  const fileWords = /\b(attachment|file|document|pdf|spreadsheet|sheet|csv|zip|archive|upload)\b/i;
+  const historyWords = /\b(above|earlier|previous|prior|before|last|older|that|those|shared|sent|uploaded|posted)\b/i;
+  const referenceVerbs = /\b(look at|describe|review|inspect|analy[sz]e|check|use|open|read|compare|refer)\b/i;
+
+  const preferImage = imageWords.test(normalized);
+  const preferFile = fileWords.test(normalized) || !preferImage;
+  const shouldRecover =
+    ((preferImage || fileWords.test(normalized)) && historyWords.test(normalized)) ||
+    (historyWords.test(normalized) && referenceVerbs.test(normalized)) ||
+    ((preferImage || fileWords.test(normalized)) && referenceVerbs.test(normalized));
+
+  return { shouldRecover, preferImage, preferFile };
+}
+
 function extractInboundAttachmentCandidates(
   html: string,
   site: string
-): Array<{ url: string; name?: string }> {
-  const matches: Array<{ url: string; name?: string }> = [];
+): InboundAttachmentCandidate[] {
+  const matches: InboundAttachmentCandidate[] = [];
   const seen = new Set<string>();
 
   const push = (rawUrl: string | undefined, rawName?: string) => {
@@ -93,9 +157,12 @@ function extractInboundAttachmentCandidates(
     }
     if (!isSameOriginZulipUpload(resolved, site) || seen.has(resolved)) return;
     seen.add(resolved);
+    const name = rawName?.trim() ? stripInlineHtml(rawName) : undefined;
     matches.push({
       url: resolved,
-      name: rawName?.trim() ? stripInlineHtml(rawName) : undefined,
+      name,
+      isImage: isLikelyImageAttachment(resolved, name),
+      origin: "current-message",
     });
   };
 
@@ -112,6 +179,64 @@ function extractInboundAttachmentCandidates(
   }
 
   return matches;
+}
+
+function listCandidatesFromMessage(
+  message: ZulipMessage,
+  site: string,
+  origin: "current-message" | "conversation-history"
+): InboundAttachmentCandidate[] {
+  return extractInboundAttachmentCandidates(message.content, site).map((candidate) => ({
+    ...candidate,
+    origin,
+    sourceMessageId: message.id,
+    sourceSenderEmail: message.sender_email,
+  }));
+}
+
+function scoreHistoryAttachmentCandidate(
+  candidate: InboundAttachmentCandidate,
+  recencyIndex: number,
+  intent: AttachmentReferenceIntent
+): number {
+  let score = Math.max(0, 1_000 - recencyIndex * 25);
+  if (candidate.isImage) score += 25;
+  if (intent.preferImage && candidate.isImage) score += 200;
+  if (intent.preferFile && !candidate.isImage) score += 75;
+  return score;
+}
+
+function selectHistoryAttachmentCandidates(params: {
+  messages: ZulipMessage[];
+  site: string;
+  currentBody: string;
+}): InboundAttachmentCandidate[] {
+  const intent = analyzeAttachmentReferenceIntent(params.currentBody);
+  if (!intent.shouldRecover) return [];
+
+  const ranked: Array<{ candidate: InboundAttachmentCandidate; score: number }> = [];
+
+  const newestFirst = [...params.messages].sort((a, b) => b.id - a.id);
+  for (const [messageIndex, message] of newestFirst.entries()) {
+    const candidates = listCandidatesFromMessage(
+      message,
+      params.site,
+      "conversation-history"
+    );
+    for (const candidate of candidates) {
+      ranked.push({
+        candidate,
+        score: scoreHistoryAttachmentCandidate(candidate, messageIndex, intent),
+      });
+      if (ranked.length >= MAX_HISTORY_ATTACHMENT_CANDIDATES) break;
+    }
+    if (ranked.length >= MAX_HISTORY_ATTACHMENT_CANDIDATES) break;
+  }
+
+  return ranked
+    .sort((left, right) => right.score - left.score)
+    .slice(0, MAX_RECOVERED_ATTACHMENTS)
+    .map((entry) => entry.candidate);
 }
 
 function resolveInboundMediaMaxBytes(cfg: Record<string, any>, accountId: string): number {
@@ -134,21 +259,32 @@ function buildAttachmentNote(attachments: DownloadedInboundAttachment[]): string
   const labels = attachments
     .map((attachment) => attachment.name?.trim())
     .filter((value): value is string => Boolean(value));
+  const recoveredOnly = attachments.every(
+    (attachment) => attachment.origin === "conversation-history"
+  );
   if (labels.length === 0) {
+    if (recoveredOnly) {
+      return attachments.length === 1
+        ? "[Recovered attachment from earlier message]"
+        : `[Recovered ${attachments.length} attachments from earlier messages]`;
+    }
     return attachments.length === 1 ? "[Attachment received]" : `[${attachments.length} attachments received]`;
   }
   const preview = labels.slice(0, 4).join(", ");
   const suffix = labels.length > 4 ? `, +${labels.length - 4} more` : "";
+  if (recoveredOnly) {
+    return `[Recovered attachment: ${preview}${suffix}]`;
+  }
   return `[Attachments: ${preview}${suffix}]`;
 }
 
-async function downloadInboundAttachments(params: {
-  html: string;
+async function downloadInboundAttachmentCandidates(params: {
+  candidates: InboundAttachmentCandidate[];
   client: ZulipClient;
   ctx: ZulipGatewayContext;
 }): Promise<DownloadedInboundAttachment[]> {
-  const { html, client, ctx } = params;
-  const candidates = extractInboundAttachmentCandidates(html, ctx.account.site);
+  const { client, ctx } = params;
+  const candidates = params.candidates;
   if (candidates.length === 0) return [];
 
   const maxBytes = resolveInboundMediaMaxBytes(
@@ -172,6 +308,9 @@ async function downloadInboundAttachments(params: {
         path: saved.path,
         contentType: saved.contentType,
         name: candidate.name ?? downloaded.fileName,
+        origin: candidate.origin,
+        sourceMessageId: candidate.sourceMessageId,
+        sourceSenderEmail: candidate.sourceSenderEmail,
       });
     } catch (err) {
       ctx.log?.warn?.(
@@ -181,12 +320,64 @@ async function downloadInboundAttachments(params: {
   }
 
   if (attachments.length > 0) {
+    const currentCount = attachments.filter(
+      (attachment) => attachment.origin === "current-message"
+    ).length;
+    const recoveredCount = attachments.length - currentCount;
     ctx.log?.info?.(
-      `[${ctx.account.accountId}] downloaded ${attachments.length} Zulip attachment(s)`
+      `[${ctx.account.accountId}] downloaded ${attachments.length} Zulip attachment(s) (current=${currentCount}, recovered=${recoveredCount})`
     );
   }
 
   return attachments;
+}
+
+async function downloadInboundAttachments(params: {
+  message: ZulipMessage;
+  client: ZulipClient;
+  ctx: ZulipGatewayContext;
+  conversationMessages?: ZulipMessage[];
+}): Promise<DownloadedInboundAttachment[]> {
+  const currentCandidates = listCandidatesFromMessage(
+    params.message,
+    params.ctx.account.site,
+    "current-message"
+  );
+  const currentAttachments = await downloadInboundAttachmentCandidates({
+    candidates: currentCandidates,
+    client: params.client,
+    ctx: params.ctx,
+  });
+  if (currentAttachments.length > 0) {
+    params.ctx.log?.debug?.(
+      `[${params.ctx.account.accountId}] using ${currentAttachments.length} current-message Zulip attachment(s) for message ${params.message.id}`
+    );
+    return currentAttachments;
+  }
+
+  const historyCandidates = selectHistoryAttachmentCandidates({
+    messages: params.conversationMessages ?? [],
+    site: params.ctx.account.site,
+    currentBody: stripHtml(params.message.content),
+  });
+  if (historyCandidates.length === 0) return [];
+
+  const recoveredAttachments = await downloadInboundAttachmentCandidates({
+    candidates: historyCandidates,
+    client: params.client,
+    ctx: params.ctx,
+  });
+  if (recoveredAttachments.length > 0) {
+    const sourceIds = recoveredAttachments
+      .map((attachment) => attachment.sourceMessageId)
+      .filter((value): value is number => typeof value === "number")
+      .join(", ");
+    params.ctx.log?.info?.(
+      `[${params.ctx.account.accountId}] recovered ${recoveredAttachments.length} Zulip attachment(s) from conversation history for message ${params.message.id}${sourceIds ? ` (source=${sourceIds})` : ""}`
+    );
+  }
+
+  return recoveredAttachments;
 }
 
 function shouldSendImmediateAck(text: string): boolean {
@@ -293,6 +484,33 @@ export async function startZulipEventLoop(
    * Fetch recent conversation history and format it as context for the agent.
    * Excludes the current message (by id) so it isn't duplicated.
    */
+  async function fetchConversationMessages(
+    mode: "dm" | "stream",
+    opts: {
+      currentMessageId: number;
+      senderEmail?: string;
+      stream?: string;
+      topic?: string;
+      limit?: number;
+    }
+  ): Promise<ZulipMessage[]> {
+    const messages =
+      mode === "dm"
+        ? await client.getDmHistory(
+            opts.senderEmail!,
+            opts.limit ?? HISTORY_LIMIT,
+            opts.currentMessageId
+          )
+        : await client.getStreamTopicHistory(
+            opts.stream!,
+            opts.topic!,
+            opts.limit ?? HISTORY_LIMIT,
+            opts.currentMessageId
+          );
+
+    return messages.filter((m) => m.id !== opts.currentMessageId);
+  }
+
   async function fetchHistory(
     mode: "dm" | "stream",
     opts: {
@@ -303,16 +521,7 @@ export async function startZulipEventLoop(
     }
   ): Promise<string> {
     try {
-      const messages =
-        mode === "dm"
-          ? await client.getDmHistory(opts.senderEmail!, HISTORY_LIMIT)
-          : await client.getStreamTopicHistory(
-              opts.stream!,
-              opts.topic!,
-              HISTORY_LIMIT
-            );
-
-      const prior = messages.filter((m) => m.id !== opts.currentMessageId);
+      const prior = await fetchConversationMessages(mode, opts);
       if (prior.length === 0) return "";
 
       const lines = prior.map((m) => {
@@ -379,11 +588,24 @@ export async function startZulipEventLoop(
       return;
     }
 
+    const conversationMessages = await fetchConversationMessages("stream", {
+      currentMessageId: message.id,
+      stream: streamName,
+      topic,
+      limit: HISTORY_ATTACHMENT_LOOKBACK,
+    }).catch((err) => {
+      ctx.log?.debug?.(
+        `[${account.accountId}] failed to fetch stream attachment history: ${String(err)}`
+      );
+      return [];
+    });
+
     const rawBody = stripHtml(message.content);
     const attachments = await downloadInboundAttachments({
-      html: message.content,
+      message,
       client,
       ctx,
+      conversationMessages,
     });
     const attachmentNote = buildAttachmentNote(attachments);
     if (!rawBody.trim() && attachments.length === 0) return;
@@ -529,12 +751,6 @@ export async function startZulipEventLoop(
   async function handleDirectMessage(message: ZulipMessage) {
     const senderEmail = message.sender_email;
     const rawBody = stripHtml(message.content);
-    const attachments = await downloadInboundAttachments({
-      html: message.content,
-      client,
-      ctx,
-    });
-    const attachmentNote = buildAttachmentNote(attachments);
 
     const authResult = await authorizeSender({
       senderId: senderEmail,
@@ -557,6 +773,24 @@ export async function startZulipEventLoop(
       );
       return;
     }
+
+    const conversationMessages = await fetchConversationMessages("dm", {
+      currentMessageId: message.id,
+      senderEmail,
+      limit: HISTORY_ATTACHMENT_LOOKBACK,
+    }).catch((err) => {
+      ctx.log?.debug?.(
+        `[${account.accountId}] failed to fetch DM attachment history: ${String(err)}`
+      );
+      return [];
+    });
+    const attachments = await downloadInboundAttachments({
+      message,
+      client,
+      ctx,
+      conversationMessages,
+    });
+    const attachmentNote = buildAttachmentNote(attachments);
 
     if (!rawBody.trim() && attachments.length === 0) {
       return;
