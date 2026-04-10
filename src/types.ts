@@ -12,6 +12,15 @@ export interface ZulipStreamConfig {
   replyPolicy?: "dm-allowlist" | "mention-only" | "open";
 }
 
+export interface ZulipHistoryConfig {
+  dmLimit?: number;
+  streamLimit?: number;
+  attachmentLookback?: number;
+  maxMessageChars?: number;
+  maxTotalChars?: number;
+  includeTimestamps?: boolean;
+}
+
 export interface ZulipAccountConfig {
   accountId: string;
   botEmail: string;
@@ -20,6 +29,7 @@ export interface ZulipAccountConfig {
   dmPolicy: string;
   allowFrom: string[];
   streams: ZulipStreamConfig;
+  history?: ZulipHistoryConfig;
 }
 
 export interface ZulipGatewayContext {

@@ -18,7 +18,7 @@ import { loadOutboundMediaFromUrl } from "openclaw/plugin-sdk/outbound-media";
 import { ZulipClient } from "./client.js";
 import { startZulipEventLoop } from "./inbound.js";
 import { getZulipRuntime } from "./runtime.js";
-import type { ZulipStreamConfig } from "./types.js";
+import type { ZulipHistoryConfig, ZulipStreamConfig } from "./types.js";
 
 // ── Config types ──
 
@@ -32,6 +32,7 @@ export interface ZulipChannelConfig {
     allowFrom?: string[];
   };
   streams?: ZulipStreamConfig;
+  history?: ZulipHistoryConfig;
 }
 
 export interface ResolvedZulipAccount {
@@ -43,6 +44,7 @@ export interface ResolvedZulipAccount {
   dmPolicy: string;
   allowFrom: string[];
   streams: ZulipStreamConfig;
+  history: Required<ZulipHistoryConfig>;
   configured: boolean;
   enabled: boolean;
 }
@@ -50,9 +52,56 @@ export interface ResolvedZulipAccount {
 // ── Helpers ──
 
 const DEFAULT_ACCOUNT_ID = "default";
+const DEFAULT_HISTORY = {
+  dmLimit: 30,
+  streamLimit: 40,
+  attachmentLookback: 12,
+  maxMessageChars: 1_200,
+  maxTotalChars: 24_000,
+  includeTimestamps: true,
+} satisfies Required<ZulipHistoryConfig>;
 
 function getZulipSection(cfg: OpenClawConfig): ZulipChannelConfig | undefined {
   return (cfg.channels as Record<string, any>)?.zulip;
+}
+
+function resolveHistoryConfig(history?: ZulipHistoryConfig): Required<ZulipHistoryConfig> {
+  const clampCount = (value: unknown, fallback: number, max: number) => {
+    return typeof value === "number" && Number.isFinite(value)
+      ? Math.max(0, Math.min(Math.floor(value), max))
+      : fallback;
+  };
+  const clampChars = (value: unknown, fallback: number, min: number, max: number) => {
+    return typeof value === "number" && Number.isFinite(value)
+      ? Math.max(min, Math.min(Math.floor(value), max))
+      : fallback;
+  };
+
+  return {
+    dmLimit: clampCount(history?.dmLimit, DEFAULT_HISTORY.dmLimit, 200),
+    streamLimit: clampCount(history?.streamLimit, DEFAULT_HISTORY.streamLimit, 200),
+    attachmentLookback: clampCount(
+      history?.attachmentLookback,
+      DEFAULT_HISTORY.attachmentLookback,
+      100
+    ),
+    maxMessageChars: clampChars(
+      history?.maxMessageChars,
+      DEFAULT_HISTORY.maxMessageChars,
+      200,
+      8_000
+    ),
+    maxTotalChars: clampChars(
+      history?.maxTotalChars,
+      DEFAULT_HISTORY.maxTotalChars,
+      1_000,
+      120_000
+    ),
+    includeTimestamps:
+      typeof history?.includeTimestamps === "boolean"
+        ? history.includeTimestamps
+        : DEFAULT_HISTORY.includeTimestamps,
+  };
 }
 
 function resolveAccount(
@@ -73,6 +122,7 @@ function resolveAccount(
     dmPolicy: section?.dm?.policy ?? "allowlist",
     allowFrom: section?.dm?.allowFrom ?? [],
     streams: section?.streams ?? {},
+    history: resolveHistoryConfig(section?.history),
     configured,
     enabled: configured,
   };
@@ -195,6 +245,17 @@ const ZulipConfigSchema = {
     botApiKey: { type: "string" as const },
     site: { type: "string" as const },
     mediaMaxMb: { type: "number" as const },
+    history: {
+      type: "object" as const,
+      properties: {
+        dmLimit: { type: "number" as const },
+        streamLimit: { type: "number" as const },
+        attachmentLookback: { type: "number" as const },
+        maxMessageChars: { type: "number" as const },
+        maxTotalChars: { type: "number" as const },
+        includeTimestamps: { type: "boolean" as const },
+      },
+    },
     dm: {
       type: "object" as const,
       properties: {

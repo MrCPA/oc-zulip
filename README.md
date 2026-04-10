@@ -79,6 +79,14 @@ Add the Zulip channel to your OpenClaw config:
       "botEmail": "bot@your-org.zulipchat.com",
       "botApiKey": "your-bot-api-key",
       "site": "https://your-org.zulipchat.com",
+      "history": {
+        "dmLimit": 30,
+        "streamLimit": 40,
+        "attachmentLookback": 12,
+        "maxMessageChars": 1200,
+        "maxTotalChars": 24000,
+        "includeTimestamps": true
+      },
       "dm": {
         "policy": "allowlist",
         "allowFrom": ["user@example.com"]
@@ -100,6 +108,21 @@ Add the Zulip channel to your OpenClaw config:
 | `botEmail` | The bot's email address in Zulip |
 | `botApiKey` | The bot's API key (from *Settings > Bots* in Zulip) |
 | `site` | Full URL of the Zulip server (e.g. `https://your-org.zulipchat.com`) |
+
+### History context
+
+Controls how much same-conversation context is fetched from Zulip and injected ahead of the current message.
+
+| Field | Description |
+|-------|-------------|
+| `history.dmLimit` | How many recent DM messages to consider for prompt context, default `30` |
+| `history.streamLimit` | How many recent messages from the same stream topic to consider, default `40` |
+| `history.attachmentLookback` | How many earlier messages to scan for referenced uploads, default `12` |
+| `history.maxMessageChars` | Per-message cap before a history line is injected, default `1200` |
+| `history.maxTotalChars` | Total history char budget injected before the current Zulip message, default `24000` |
+| `history.includeTimestamps` | Include ISO timestamps in injected history lines, default `true` |
+
+The plugin formats history as a compact same-topic or DM transcript, then clearly separates it from the current message so the model has better continuity.
 
 ### DM policies
 

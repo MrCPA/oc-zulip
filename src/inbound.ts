@@ -17,7 +17,10 @@ import {
   sleep,
 } from "./util.js";
 
-const HISTORY_LIMIT = 20;
+const DEFAULT_DM_HISTORY_LIMIT = 30;
+const DEFAULT_STREAM_HISTORY_LIMIT = 40;
+const DEFAULT_HISTORY_MAX_MESSAGE_CHARS = 1_200;
+const DEFAULT_HISTORY_MAX_TOTAL_CHARS = 24_000;
 
 import {
   dispatchInboundDirectDmWithRuntime,
@@ -67,6 +70,12 @@ interface AttachmentReferenceIntent {
   preferFile: boolean;
 }
 
+interface FormattedHistoryEntry {
+  sender: string;
+  body: string;
+  timestamp: number;
+}
+
 function decodeHtmlEntities(value: string): string {
   return value
     .replace(/&nbsp;/gi, " ")
@@ -85,6 +94,21 @@ function stripInlineHtml(value: string): string {
   return decodeHtmlEntities(value.replace(/<[^>]+>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function normalizeHistoryText(value: string, maxChars: number): string {
+  const normalized = stripHtml(value).replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxChars) return normalized;
+  if (maxChars <= 1) return normalized.slice(0, maxChars);
+  return `${normalized.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+}
+
+function formatHistoryTimestamp(timestamp: number): string {
+  return new Date(timestamp)
+    .toISOString()
+    .replace("T", " ")
+    .replace(/\.\d{3}Z$/, "Z");
 }
 
 function isSameOriginZulipUpload(url: string, site: string): boolean {
@@ -237,6 +261,66 @@ function selectHistoryAttachmentCandidates(params: {
     .sort((left, right) => right.score - left.score)
     .slice(0, MAX_RECOVERED_ATTACHMENTS)
     .map((entry) => entry.candidate);
+}
+
+function buildFormattedHistoryEntries(params: {
+  messages: ZulipMessage[];
+  botEmail: string;
+  botName: string;
+  maxMessageChars: number;
+}): FormattedHistoryEntry[] {
+  return params.messages
+    .map((message) => {
+      const sender =
+        message.sender_email === params.botEmail
+          ? `${params.botName} (bot)`
+          : message.sender_full_name || message.sender_email;
+      const body = normalizeHistoryText(message.content, params.maxMessageChars);
+      return {
+        sender,
+        body,
+        timestamp: message.timestamp * 1_000,
+      };
+    })
+    .filter((entry) => Boolean(entry.body));
+}
+
+function trimFormattedHistoryEntries(
+  entries: FormattedHistoryEntry[],
+  maxTotalChars: number,
+  includeTimestamps: boolean
+): FormattedHistoryEntry[] {
+  if (entries.length === 0) return [];
+  const selected: FormattedHistoryEntry[] = [];
+  let remainingChars = Math.max(maxTotalChars, 0);
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    const line = `${includeTimestamps ? `[${formatHistoryTimestamp(entry.timestamp)}] ` : ""}${entry.sender}: ${entry.body}`;
+    if (selected.length > 0 && line.length > remainingChars) break;
+    selected.push(entry);
+    remainingChars -= line.length;
+    if (remainingChars <= 0) break;
+  }
+  return selected.reverse();
+}
+
+function renderConversationHistoryBlock(params: {
+  entries: FormattedHistoryEntry[];
+  mode: "dm" | "stream";
+  topic?: string;
+  stream?: string;
+  includeTimestamps: boolean;
+}): string {
+  if (params.entries.length === 0) return "";
+  const label =
+    params.mode === "stream"
+      ? `same Zulip topic history (${params.stream ?? "stream"} > ${params.topic ?? "topic"})`
+      : "recent Zulip DM history";
+  const lines = params.entries.map((entry) => {
+    const prefix = params.includeTimestamps ? `[${formatHistoryTimestamp(entry.timestamp)}] ` : "";
+    return `${prefix}${entry.sender}: ${entry.body}`;
+  });
+  return `--- ${label} ---\n${lines.join("\n")}\n--- end history ---`;
 }
 
 function resolveInboundMediaMaxBytes(cfg: Record<string, any>, accountId: string): number {
@@ -494,55 +578,51 @@ export async function startZulipEventLoop(
       limit?: number;
     }
   ): Promise<ZulipMessage[]> {
+    const fallbackLimit =
+      mode === "dm" ? account.history?.dmLimit ?? DEFAULT_DM_HISTORY_LIMIT : account.history?.streamLimit ?? DEFAULT_STREAM_HISTORY_LIMIT;
     const messages =
       mode === "dm"
         ? await client.getDmHistory(
             opts.senderEmail!,
-            opts.limit ?? HISTORY_LIMIT,
+            opts.limit ?? fallbackLimit,
             opts.currentMessageId
           )
         : await client.getStreamTopicHistory(
             opts.stream!,
             opts.topic!,
-            opts.limit ?? HISTORY_LIMIT,
+            opts.limit ?? fallbackLimit,
             opts.currentMessageId
           );
 
     return messages.filter((m) => m.id !== opts.currentMessageId);
   }
 
-  async function fetchHistory(
-    mode: "dm" | "stream",
-    opts: {
-      currentMessageId: number;
-      senderEmail?: string;
-      stream?: string;
-      topic?: string;
-    }
-  ): Promise<string> {
-    try {
-      const prior = await fetchConversationMessages(mode, opts);
-      if (prior.length === 0) return "";
-
-      const lines = prior.map((m) => {
-        const name =
-          m.sender_email === account.botEmail
-            ? `${me.full_name} (bot)`
-            : m.sender_full_name;
-        return `[${name}]: ${stripHtml(m.content)}`;
-      });
-
-      return (
-        "--- conversation history ---\n" +
-        lines.join("\n") +
-        "\n--- end history ---\n\n"
-      );
-    } catch (err) {
-      ctx.log?.debug?.(
-        `[${account.accountId}] failed to fetch conversation history: ${String(err)}`
-      );
-      return "";
-    }
+  function buildHistoryContext(params: {
+    mode: "dm" | "stream";
+    messages: ZulipMessage[];
+    stream?: string;
+    topic?: string;
+  }): { historyBlock: string } {
+    const formatted = buildFormattedHistoryEntries({
+      messages: params.messages,
+      botEmail: account.botEmail,
+      botName: me.full_name,
+      maxMessageChars: account.history?.maxMessageChars ?? DEFAULT_HISTORY_MAX_MESSAGE_CHARS,
+    });
+    const trimmed = trimFormattedHistoryEntries(
+      formatted,
+      account.history?.maxTotalChars ?? DEFAULT_HISTORY_MAX_TOTAL_CHARS,
+      account.history?.includeTimestamps ?? true
+    );
+    return {
+      historyBlock: renderConversationHistoryBlock({
+        entries: trimmed,
+        mode: params.mode,
+        stream: params.stream,
+        topic: params.topic,
+        includeTimestamps: account.history?.includeTimestamps ?? true,
+      }),
+    };
   }
 
   const authorizeSender = createPreCryptoDirectDmAuthorizer({
@@ -588,11 +668,15 @@ export async function startZulipEventLoop(
       return;
     }
 
+    const streamHistoryAttachmentLookback = Math.max(
+      0,
+      account.history?.attachmentLookback ?? HISTORY_ATTACHMENT_LOOKBACK
+    );
     const conversationMessages = await fetchConversationMessages("stream", {
       currentMessageId: message.id,
       stream: streamName,
       topic,
-      limit: HISTORY_ATTACHMENT_LOOKBACK,
+      limit: streamHistoryAttachmentLookback,
     }).catch((err) => {
       ctx.log?.debug?.(
         `[${account.accountId}] failed to fetch stream attachment history: ${String(err)}`
@@ -665,13 +749,26 @@ export async function startZulipEventLoop(
       return;
     }
 
-    const history = await fetchHistory("stream", {
+    const topicHistoryMessages = await fetchConversationMessages("stream", {
       currentMessageId: message.id,
+      stream: streamName,
+      topic,
+    }).catch((err) => {
+      ctx.log?.debug?.(
+        `[${account.accountId}] failed to fetch conversation history: ${String(err)}`
+      );
+      return [];
+    });
+    const streamHistoryContext = buildHistoryContext({
+      mode: "stream",
+      messages: topicHistoryMessages,
       stream: streamName,
       topic,
     });
     const bodyForAgent = [
-      history + effectiveBody,
+      streamHistoryContext.historyBlock,
+      "--- current Zulip stream message ---",
+      effectiveBody,
       attachmentNote && attachmentNote !== effectiveBody ? attachmentNote : "",
     ]
       .filter(Boolean)
@@ -774,10 +871,14 @@ export async function startZulipEventLoop(
       return;
     }
 
+    const dmHistoryAttachmentLookback = Math.max(
+      0,
+      account.history?.attachmentLookback ?? HISTORY_ATTACHMENT_LOOKBACK
+    );
     const conversationMessages = await fetchConversationMessages("dm", {
       currentMessageId: message.id,
       senderEmail,
-      limit: HISTORY_ATTACHMENT_LOOKBACK,
+      limit: dmHistoryAttachmentLookback,
     }).catch((err) => {
       ctx.log?.debug?.(
         `[${account.accountId}] failed to fetch DM attachment history: ${String(err)}`
@@ -796,13 +897,24 @@ export async function startZulipEventLoop(
       return;
     }
 
-    const history = await fetchHistory("dm", {
+    const dmHistoryMessages = await fetchConversationMessages("dm", {
       currentMessageId: message.id,
       senderEmail,
+    }).catch((err) => {
+      ctx.log?.debug?.(
+        `[${account.accountId}] failed to fetch conversation history: ${String(err)}`
+      );
+      return [];
+    });
+    const dmHistoryContext = buildHistoryContext({
+      mode: "dm",
+      messages: dmHistoryMessages,
     });
     const effectiveBody = rawBody || attachmentNote;
     const bodyForAgent = [
-      history + effectiveBody,
+      dmHistoryContext.historyBlock,
+      "--- current Zulip DM ---",
+      effectiveBody,
       attachmentNote && attachmentNote !== effectiveBody ? attachmentNote : "",
     ]
       .filter(Boolean)
