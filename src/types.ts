@@ -18,6 +18,8 @@ export interface ZulipHistoryConfig {
   attachmentLookback?: number;
   maxMessageChars?: number;
   maxTotalChars?: number;
+  recentExactCount?: number;
+  recentExactMaxChars?: number;
   includeTimestamps?: boolean;
 }
 

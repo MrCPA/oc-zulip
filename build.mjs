@@ -32,4 +32,11 @@ await build({
   outdir: "dist",
 });
 
+// Test-support entry
+await build({
+  ...shared,
+  entryPoints: ["src/history.ts"],
+  outdir: "dist/src",
+});
+
 console.log("Build complete → dist/");

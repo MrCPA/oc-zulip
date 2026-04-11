@@ -6,7 +6,7 @@ OpenClaw channel plugin for [Zulip](https://zulip.com). Connects an OpenClaw ins
 
 - **DM routing** with allowlist, open, and pairing access policies
 - **Stream/channel support** with per-stream allowlists and reply policies (mention-only, open, dm-allowlist)
-- **Conversation history** — fetches recent messages so the agent has context
+- **Conversation history** — dual-layer same-conversation context with recent exact transcript plus older compacted history
 - **Topic-aware** — each stream topic gets its own isolated session
 - **Topic resolve/unresolve** — `@bot resolve` / `@bot unresolve` to toggle Zulip's topic resolved state
 - **Event queue long-polling** for real-time inbound message handling
@@ -85,6 +85,8 @@ Add the Zulip channel to your OpenClaw config:
         "attachmentLookback": 12,
         "maxMessageChars": 1200,
         "maxTotalChars": 24000,
+        "recentExactCount": 6,
+        "recentExactMaxChars": 8000,
         "includeTimestamps": true
       },
       "dm": {
@@ -118,11 +120,18 @@ Controls how much same-conversation context is fetched from Zulip and injected a
 | `history.dmLimit` | How many recent DM messages to consider for prompt context, default `30` |
 | `history.streamLimit` | How many recent messages from the same stream topic to consider, default `40` |
 | `history.attachmentLookback` | How many earlier messages to scan for referenced uploads, default `12` |
-| `history.maxMessageChars` | Per-message cap before a history line is injected, default `1200` |
-| `history.maxTotalChars` | Total history char budget injected before the current Zulip message, default `24000` |
+| `history.maxMessageChars` | Per-message cap for older compacted history lines, default `1200` |
+| `history.maxTotalChars` | Hard total char budget for all injected history, default `24000` |
+| `history.recentExactCount` | Number of newest same-DM or same-topic messages kept in a higher-fidelity transcript block, default `6` |
+| `history.recentExactMaxChars` | Per-message cap for the recent exact transcript block, default `8000` |
 | `history.includeTimestamps` | Include ISO timestamps in injected history lines, default `true` |
 
-The plugin formats history as a compact same-topic or DM transcript, then clearly separates it from the current message so the model has better continuity.
+The plugin now uses a dual-layer history strategy:
+
+- **Recent exact block**: the newest messages from the same DM or stream topic are kept with much higher fidelity, preserving paragraph breaks and common quote, list, and code structure where possible.
+- **Older summary block**: older conversation history stays compacted so prompts remain bounded.
+
+Both layers share the same hard `history.maxTotalChars` budget. If the exact block alone would exceed that budget, it is trimmed and the older summary block is dropped first.
 
 ### DM policies
 

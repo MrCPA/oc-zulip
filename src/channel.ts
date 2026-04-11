@@ -58,6 +58,8 @@ const DEFAULT_HISTORY = {
   attachmentLookback: 12,
   maxMessageChars: 1_200,
   maxTotalChars: 24_000,
+  recentExactCount: 6,
+  recentExactMaxChars: 8_000,
   includeTimestamps: true,
 } satisfies Required<ZulipHistoryConfig>;
 
@@ -96,6 +98,17 @@ function resolveHistoryConfig(history?: ZulipHistoryConfig): Required<ZulipHisto
       DEFAULT_HISTORY.maxTotalChars,
       1_000,
       120_000
+    ),
+    recentExactCount: clampCount(
+      history?.recentExactCount,
+      DEFAULT_HISTORY.recentExactCount,
+      50
+    ),
+    recentExactMaxChars: clampChars(
+      history?.recentExactMaxChars,
+      DEFAULT_HISTORY.recentExactMaxChars,
+      500,
+      40_000
     ),
     includeTimestamps:
       typeof history?.includeTimestamps === "boolean"
@@ -253,6 +266,8 @@ const ZulipConfigSchema = {
         attachmentLookback: { type: "number" as const },
         maxMessageChars: { type: "number" as const },
         maxTotalChars: { type: "number" as const },
+        recentExactCount: { type: "number" as const },
+        recentExactMaxChars: { type: "number" as const },
         includeTimestamps: { type: "boolean" as const },
       },
     },

@@ -16,6 +16,7 @@ import {
   isStreamAllowed,
   sleep,
 } from "./util.js";
+import { renderCurrentMessageText, renderHistoryContext } from "./history.js";
 
 const DEFAULT_DM_HISTORY_LIMIT = 30;
 const DEFAULT_STREAM_HISTORY_LIMIT = 40;
@@ -70,12 +71,6 @@ interface AttachmentReferenceIntent {
   preferFile: boolean;
 }
 
-interface FormattedHistoryEntry {
-  sender: string;
-  body: string;
-  timestamp: number;
-}
-
 function decodeHtmlEntities(value: string): string {
   return value
     .replace(/&nbsp;/gi, " ")
@@ -96,20 +91,6 @@ function stripInlineHtml(value: string): string {
     .trim();
 }
 
-function normalizeHistoryText(value: string, maxChars: number): string {
-  const normalized = stripHtml(value).replace(/\s+/g, " ").trim();
-  if (!normalized) return "";
-  if (normalized.length <= maxChars) return normalized;
-  if (maxChars <= 1) return normalized.slice(0, maxChars);
-  return `${normalized.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
-}
-
-function formatHistoryTimestamp(timestamp: number): string {
-  return new Date(timestamp)
-    .toISOString()
-    .replace("T", " ")
-    .replace(/\.\d{3}Z$/, "Z");
-}
 
 function isSameOriginZulipUpload(url: string, site: string): boolean {
   try {
@@ -263,65 +244,6 @@ function selectHistoryAttachmentCandidates(params: {
     .map((entry) => entry.candidate);
 }
 
-function buildFormattedHistoryEntries(params: {
-  messages: ZulipMessage[];
-  botEmail: string;
-  botName: string;
-  maxMessageChars: number;
-}): FormattedHistoryEntry[] {
-  return params.messages
-    .map((message) => {
-      const sender =
-        message.sender_email === params.botEmail
-          ? `${params.botName} (bot)`
-          : message.sender_full_name || message.sender_email;
-      const body = normalizeHistoryText(message.content, params.maxMessageChars);
-      return {
-        sender,
-        body,
-        timestamp: message.timestamp * 1_000,
-      };
-    })
-    .filter((entry) => Boolean(entry.body));
-}
-
-function trimFormattedHistoryEntries(
-  entries: FormattedHistoryEntry[],
-  maxTotalChars: number,
-  includeTimestamps: boolean
-): FormattedHistoryEntry[] {
-  if (entries.length === 0) return [];
-  const selected: FormattedHistoryEntry[] = [];
-  let remainingChars = Math.max(maxTotalChars, 0);
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index];
-    const line = `${includeTimestamps ? `[${formatHistoryTimestamp(entry.timestamp)}] ` : ""}${entry.sender}: ${entry.body}`;
-    if (selected.length > 0 && line.length > remainingChars) break;
-    selected.push(entry);
-    remainingChars -= line.length;
-    if (remainingChars <= 0) break;
-  }
-  return selected.reverse();
-}
-
-function renderConversationHistoryBlock(params: {
-  entries: FormattedHistoryEntry[];
-  mode: "dm" | "stream";
-  topic?: string;
-  stream?: string;
-  includeTimestamps: boolean;
-}): string {
-  if (params.entries.length === 0) return "";
-  const label =
-    params.mode === "stream"
-      ? `same Zulip topic history (${params.stream ?? "stream"} > ${params.topic ?? "topic"})`
-      : "recent Zulip DM history";
-  const lines = params.entries.map((entry) => {
-    const prefix = params.includeTimestamps ? `[${formatHistoryTimestamp(entry.timestamp)}] ` : "";
-    return `${prefix}${entry.sender}: ${entry.body}`;
-  });
-  return `--- ${label} ---\n${lines.join("\n")}\n--- end history ---`;
-}
 
 function resolveInboundMediaMaxBytes(cfg: Record<string, any>, accountId: string): number {
   return (
@@ -602,27 +524,19 @@ export async function startZulipEventLoop(
     messages: ZulipMessage[];
     stream?: string;
     topic?: string;
-  }): { historyBlock: string } {
-    const formatted = buildFormattedHistoryEntries({
-      messages: params.messages,
+  }): { recentExactBlock: string; olderSummaryBlock: string; historyBlock: string } {
+    return renderHistoryContext(params.messages, {
       botEmail: account.botEmail,
       botName: me.full_name,
+      mode: params.mode,
+      stream: params.stream,
+      topic: params.topic,
+      includeTimestamps: account.history?.includeTimestamps ?? true,
       maxMessageChars: account.history?.maxMessageChars ?? DEFAULT_HISTORY_MAX_MESSAGE_CHARS,
+      maxTotalChars: account.history?.maxTotalChars ?? DEFAULT_HISTORY_MAX_TOTAL_CHARS,
+      recentExactCount: account.history?.recentExactCount ?? 6,
+      recentExactMaxChars: account.history?.recentExactMaxChars ?? 8_000,
     });
-    const trimmed = trimFormattedHistoryEntries(
-      formatted,
-      account.history?.maxTotalChars ?? DEFAULT_HISTORY_MAX_TOTAL_CHARS,
-      account.history?.includeTimestamps ?? true
-    );
-    return {
-      historyBlock: renderConversationHistoryBlock({
-        entries: trimmed,
-        mode: params.mode,
-        stream: params.stream,
-        topic: params.topic,
-        includeTimestamps: account.history?.includeTimestamps ?? true,
-      }),
-    };
   }
 
   const authorizeSender = createPreCryptoDirectDmAuthorizer({
@@ -684,7 +598,7 @@ export async function startZulipEventLoop(
       return [];
     });
 
-    const rawBody = stripHtml(message.content);
+    const rawBody = renderCurrentMessageText(message.content);
     const attachments = await downloadInboundAttachments({
       message,
       client,
@@ -847,7 +761,7 @@ export async function startZulipEventLoop(
 
   async function handleDirectMessage(message: ZulipMessage) {
     const senderEmail = message.sender_email;
-    const rawBody = stripHtml(message.content);
+    const rawBody = renderCurrentMessageText(message.content);
 
     const authResult = await authorizeSender({
       senderId: senderEmail,

@@ -37,7 +37,8 @@
   "scripts": {
     "build": "node build.mjs",
     "prepack": "node build.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node build.mjs && node --test"
   },
   "peerDependencies": {
     "openclaw": "*"
